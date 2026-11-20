@@ -1,0 +1,544 @@
+#include "settings.h"
+#include "src/gui/shell/sx_palette.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+
+#include "lvgl/lvgl.h"
+
+#include "src/gui/settings/appearance.h"
+#include "src/gui/settings/ccsettings.h"
+#include "src/gui/shell/confirm.h"
+#include "src/gui/settings/devoptions.h"
+#include "src/gui/settings/language.h"
+#include "src/gui/settings/musicsettings.h"
+#include "src/gui/fonts/fonts.h"
+#include "src/gui/settings/kblayoutpage.h"
+#include "src/gui/shell/keyboard.h"
+#include "src/gui/nowplaying/player.h"
+#include "src/gui/settings/powersettings.h"
+#include "src/gui/settings/remap.h"
+#include "src/gui/settings/screensaver.h"
+#include "src/gui/shell/settingsrow.h"
+#include "src/gui/shell/switcher.h"
+#include "src/gui/shell/sx_card.h"
+#include "src/gui/shell/sx_styles.h"
+#include "src/gui/settings/systempage.h"
+#include "src/gui/shell/theme.h"
+#include "src/gui/settings/timeset.h"
+#include "src/system/core/config.h"
+#include "src/system/audio/headset.h"
+#include "src/system/core/lang.h"
+#include "src/system/device/power.h"
+#include "src/system/device/screenshot.h"
+#include "src/system/device/system.h"
+
+lv_obj_t *settings_screen;
+
+static void clock_clicked_cb(lv_event_t *e) {
+	(void)e;
+	timeset_show();
+}
+
+// In-line remote keys on the headphone cable: play/pause and the two skips.
+// Under More, since it is touched when headphones change, not daily.
+static lv_obj_t *headset_switch;
+
+static void headset_toggled_cb(lv_event_t *e) {
+	(void)e;
+	headset_set_controls_enabled(lv_obj_has_state(headset_switch, LV_STATE_CHECKED));
+}
+
+// Firmware update lives on the System page; see systempage.c.
+
+// ---------------------------------------------------------------------------
+// Screen: the panel brightness, a continuous slider written straight to the
+// backlight (power_set_brightness), like the stock player's brightness bar.
+// The chosen level is saved and handed to power_init() on the next boot.
+// ---------------------------------------------------------------------------
+
+static lv_obj_t *screensettings_screen;
+static lv_obj_t *othersettings_screen;
+static lv_obj_t *brightness_slider;
+static lv_obj_t *brightness_value;
+static lv_obj_t *screen_off_value;
+static lv_obj_t *screen_off_slider;
+static lv_obj_t *doubletap_switch;
+static lv_obj_t *screensaver_switch;
+static lv_obj_t *screensaver_pills;
+static lv_obj_t *screensaver_album_pill;
+static lv_obj_t *screensaver_images_pill;
+static lv_obj_t *rotate_switch;
+
+static void doubletap_toggle_cb(lv_event_t *e) {
+	(void)e;
+	bool on = lv_obj_has_state(doubletap_switch, LV_STATE_CHECKED);
+	config_set_int("screen", "double_tap_wake", on ? 1 : 0);
+	config_save();
+	power_set_double_tap_wake(on);
+}
+
+// The two pills under the switch, and which of them is lit. Hidden with the
+// screensaver off: "album or pictures" means nothing when there is no
+// screensaver to show either.
+static void screensaver_refresh(void) {
+	if (!screensaver_switch) {
+		return;
+	}
+	bool on = screensaver_get_enabled();
+	if (on) {
+		lv_obj_add_state(screensaver_switch, LV_STATE_CHECKED);
+		lv_obj_set_hidden(screensaver_pills, false);
+	} else {
+		lv_obj_remove_state(screensaver_switch, LV_STATE_CHECKED);
+		lv_obj_set_hidden(screensaver_pills, true);
+	}
+	screensaver_source_t source = screensaver_source();
+	settingsrow_pill_active(screensaver_album_pill, source == SCREENSAVER_SOURCE_ALBUM);
+	settingsrow_pill_active(screensaver_images_pill, source == SCREENSAVER_SOURCE_IMAGES);
+}
+
+static void screensaver_toggle_cb(lv_event_t *e) {
+	(void)e;
+	// Just the setting: the screensaver belongs to the next wake, not to the
+	// moment the switch is flipped.
+	screensaver_set_enabled(lv_obj_has_state(screensaver_switch, LV_STATE_CHECKED));
+	screensaver_refresh();
+}
+
+static void screensaver_source_cb(lv_event_t *e) {
+	if (player_sheet_drag_active() || switcher_back_drag_active()) {
+		return;
+	}
+	screensaver_source_t chosen = (screensaver_source_t)(intptr_t)lv_event_get_user_data(e);
+
+	// Pictures is refused rather than accepted-and-blank: the folder is judged
+	// now, while the user is looking at the answer, instead of at a wake hours
+	// later with nothing to show and no way to tell why.
+	if (chosen == SCREENSAVER_SOURCE_IMAGES && !screensaver_has_images()) {
+		confirm_notice("settings_no_pictures_to_show", "screensaver_empty_note");
+		screensaver_set_source(SCREENSAVER_SOURCE_ALBUM);
+		screensaver_refresh();
+		return;
+	}
+
+	screensaver_set_source(chosen);
+	screensaver_refresh();
+}
+
+// Rotate screen: the picture turns 180 degrees and the touch panel with it.
+// The skip keys do not: the button remap page is where a user who wants them
+// the other way round says so.
+static void rotate_toggle_cb(lv_event_t *e) {
+	(void)e;
+	bool on = lv_obj_has_state(rotate_switch, LV_STATE_CHECKED);
+
+	display_set_rotated(on);
+
+	config_set_int("screen", "rotate_180", on ? 1 : 0);
+	config_save();
+
+	if (on && !display_rotation_supported()) {
+		gui_notify_popup("settings_rotation_unavailable");
+	}
+}
+
+// The lowest level offered. The stock player never writes below 5 of its
+// Blanking this panel powers its touch controller down with it, so the only
+// way back is the power key. Thirty seconds is the default; "never" is there
+// for anyone who would rather not be caught out by it.
+//
+// The setting is written under [power], where it has always lived: it is read
+// by power.c, and moving the key would lose everybody's choice.
+static const struct {
+	int seconds;
+	const char *label;
+} SCREEN_OFF[] = {
+	{0, "power_never"},		 {15, "power_15_seconds"}, {30, "power_30_seconds"},
+	{60, "power_1_minute"},	 {120, "power_2_minutes"}, {300, "power_5_minutes"},
+};
+#define SCREEN_OFF_COUNT ((int)(sizeof(SCREEN_OFF) / sizeof(SCREEN_OFF[0])))
+#define SCREEN_OFF_DEFAULT 30
+
+static int screen_off_index(void) {
+	int seconds = (int)config_get_int("power", "screen_off_seconds", SCREEN_OFF_DEFAULT);
+	for (int i = 0; i < SCREEN_OFF_COUNT; i++) {
+		if (SCREEN_OFF[i].seconds == seconds) {
+			return i;
+		}
+	}
+	return 2; // the 30 second default
+}
+
+void settings_apply_screen_off(void) {
+	int seconds = SCREEN_OFF[screen_off_index()].seconds;
+	power_set_screen_off_timeout((uint32_t)seconds * 1000);
+	power_set_screen_off_enabled(seconds > 0);
+}
+
+static void screen_off_changed_cb(lv_event_t *e) {
+	(void)e;
+	int index = (int)lv_slider_get_value(screen_off_slider);
+	config_set_int("power", "screen_off_seconds", SCREEN_OFF[index].seconds);
+	config_save();
+	settings_apply_screen_off();
+	lv_label_set_text(screen_off_value, tr(SCREEN_OFF[index].label));
+}
+
+// 0..100 scale -- anything under that is indistinguishable from off.
+static long brightness_floor(long max) {
+	long floor = max / 20;
+	return floor > 0 ? floor : 1;
+}
+
+static void brightness_show_value(long value, long max) {
+	lv_label_set_text_fmt(brightness_value, "%d%%", (int)((value * 100 + max / 2) / max));
+}
+
+// Live while dragging: the panel follows the finger.
+static void brightness_changed_cb(lv_event_t *e) {
+	(void)e;
+	long value = lv_slider_get_value(brightness_slider);
+	power_set_brightness(value);
+	brightness_show_value(value, lv_slider_get_max_value(brightness_slider));
+}
+
+// Persisted once, when the finger lifts -- not on every pixel of the drag.
+static void brightness_released_cb(lv_event_t *e) {
+	(void)e;
+	config_set_int("screen", "brightness", (int)lv_slider_get_value(brightness_slider));
+	config_save();
+}
+
+// The panel's real range is only known after power_init() has run, which is
+// after the GUI is built -- so the slider syncs itself every time the page
+// comes up.
+static void screensettings_loaded_cb(lv_event_t *e) {
+	(void)e;
+	long max = power_get_max_brightness();
+	if (max <= 0) {
+		max = 100;
+	}
+	lv_slider_set_range(brightness_slider, (int32_t)brightness_floor(max), (int32_t)max);
+
+	long value = power_get_brightness();
+	if (value < brightness_floor(max)) {
+		value = max;
+	}
+	lv_slider_set_value(brightness_slider, (int32_t)value, LV_ANIM_OFF);
+	brightness_show_value(value, max);
+}
+
+// The slider's fill re-reads the palette after a theme/accent change.
+static void refresh_brightness_slider(void) {
+	theme_apply_slider_knob(brightness_slider);
+	if (brightness_slider) {
+		lv_obj_set_style_bg_color(brightness_slider, sx_pal()->panel_accent, LV_PART_INDICATOR);
+		lv_obj_set_style_bg_color(brightness_slider, sx_pal()->panel_text2, LV_PART_MAIN);
+	}
+}
+
+static void build_screen_page(gui_config_t *cfg) {
+	screensettings_screen = lv_obj_create(NULL);
+	lv_obj_t *container = settingsrow_page(screensettings_screen, cfg, "settings_screen");
+
+	// The brightness card: name up top, the current percent on the right, a
+	// full-width slider underneath.
+	lv_obj_t *card = lv_obj_create(container);
+	lv_obj_set_width(card, lv_pct(100));
+	lv_obj_set_height(card, 140);
+	// The 2.0 card's look, as on the slider cards under it (settingsrow.c):
+	// not a button, so no pressed fill.
+	sx_card_style(card);
+	lv_obj_remove_style(card, &sx_style_panel_press, LV_STATE_PRESSED);
+	lv_obj_set_style_pad_ver(card, 14, 0);
+	lv_obj_set_scrollable(card, false);
+	lv_obj_set_event_bubble(card, true);
+
+	lv_obj_t *label = lv_label_create(card);
+	lv_label_set_text(label, tr("brightness"));
+	lv_obj_add_style(label, &sx_style_panel_text, 0);
+	lv_obj_set_style_text_font(label, &font_ui_24, 0);
+	lv_obj_align(label, LV_ALIGN_TOP_LEFT, 0, 0);
+
+	brightness_value = lv_label_create(card);
+	lv_obj_add_style(brightness_value, &sx_style_panel_text2, 0);
+	lv_obj_set_style_text_font(brightness_value, &font_ui_22, 0);
+	lv_obj_align(brightness_value, LV_ALIGN_TOP_RIGHT, 0, 0);
+	lv_label_set_text(brightness_value, "");
+
+	// The Adwaita slider: thin round trough, accent fill, white knob.
+	brightness_slider = lv_slider_create(card);
+	lv_obj_set_width(brightness_slider, lv_pct(100));
+	lv_obj_set_height(brightness_slider, 10);
+	lv_obj_align(brightness_slider, LV_ALIGN_BOTTOM_MID, 0, -14);
+	lv_slider_set_range(brightness_slider, 5, 100);
+
+	lv_obj_set_style_radius(brightness_slider, LV_RADIUS_CIRCLE, LV_PART_MAIN);
+	lv_obj_set_style_bg_color(brightness_slider, sx_pal()->panel_text2, LV_PART_MAIN);
+	lv_obj_set_style_bg_opa(brightness_slider, LV_OPA_40, LV_PART_MAIN);
+
+	lv_obj_set_style_radius(brightness_slider, LV_RADIUS_CIRCLE, LV_PART_INDICATOR);
+	lv_obj_set_style_bg_color(brightness_slider, sx_pal()->panel_accent, LV_PART_INDICATOR);
+
+	lv_obj_set_style_radius(brightness_slider, LV_RADIUS_CIRCLE, LV_PART_KNOB);
+	lv_obj_set_style_bg_color(brightness_slider, lv_color_white(), LV_PART_KNOB);
+	theme_apply_slider_knob(brightness_slider);
+	lv_obj_set_style_pad_all(brightness_slider, 8, LV_PART_KNOB);
+	lv_obj_set_style_shadow_width(brightness_slider, 8, LV_PART_KNOB);
+	lv_obj_set_style_shadow_opa(brightness_slider, LV_OPA_30, LV_PART_KNOB);
+	lv_obj_set_style_shadow_color(brightness_slider, lv_color_black(), LV_PART_KNOB);
+	lv_obj_set_style_shadow_offset_y(brightness_slider, 1, LV_PART_KNOB);
+
+	// A slim trough is a hard touch target; let the finger land anywhere in
+	// the card's lower half.
+	lv_obj_set_ext_click_area(brightness_slider, 24);
+
+	lv_obj_add_event_cb(brightness_slider, brightness_changed_cb, LV_EVENT_VALUE_CHANGED, NULL);
+	lv_obj_add_event_cb(brightness_slider, brightness_released_cb, LV_EVENT_RELEASED, NULL);
+
+	// How long the panel waits before it goes dark. Straight under the
+	// brightness: both are about the panel, and the one that switches it off is
+	// the first thing looked for after the one that sets how bright it is.
+	settingsrow_slider(container, "power_screen_off", SCREEN_OFF_COUNT, &screen_off_value, &screen_off_slider,
+					   screen_off_changed_cb);
+	lv_slider_set_value(screen_off_slider, screen_off_index(), LV_ANIM_OFF);
+	lv_label_set_text(screen_off_value, tr(SCREEN_OFF[screen_off_index()].label));
+
+	// Double-tap to wake: the touch controller's gesture mode. With the
+	// screen off, two taps light it back up -- the way the stock player's
+	// option works, through the same sysfs switch.
+	// Not on the R1, whose touch controller sleeps with the panel.
+	if (power_double_tap_wake_supported()) {
+		settingsrow_toggle(container, "settings_double_tap_to_wake", &doubletap_switch, doubletap_toggle_cb);
+		if (config_get_int("screen", "double_tap_wake", 0)) {
+			lv_obj_add_state(doubletap_switch, LV_STATE_CHECKED);
+		}
+	}
+
+	// The screensaver: a picture, the track and the time over everything else
+	// the moment the panel lights back up. A swipe up puts it away. The pills
+	// say where the picture comes from -- the record being played, or the
+	// card's own Screensaver folder.
+	settingsrow_toggle_pills(container, "screensaver", screensaver_toggle_cb, &screensaver_switch,
+							 &screensaver_pills);
+	screensaver_album_pill =
+		settingsrow_pill(screensaver_pills, "screensaver_source_album", SCREENSAVER_SOURCE_ALBUM, screensaver_source_cb);
+	screensaver_images_pill =
+		settingsrow_pill(screensaver_pills, "screensaver_source_images", SCREENSAVER_SOURCE_IMAGES, screensaver_source_cb);
+	screensaver_refresh();
+
+	// Upside down, for holding the player the other way up.
+	settingsrow_toggle(container, "settings_rotate_screen", &rotate_switch, rotate_toggle_cb);
+	if (config_get_int("screen", "rotate_180", 0)) {
+		lv_obj_add_state(rotate_switch, LV_STATE_CHECKED);
+	}
+
+	lv_obj_add_event_cb(screensettings_screen, screensettings_loaded_cb, LV_EVENT_SCREEN_LOADED, NULL);
+	switcher_attach_back_gesture(screensettings_screen);
+	theme_register_refresh(refresh_brightness_slider);
+	// The pills carry hand-set colours, so a theme change has to repaint them.
+	theme_register_refresh(screensaver_refresh);
+}
+
+// The developer options row is kept in a global because it appears and
+// disappears: it is always in the list, but only visible once unlocked.
+static lv_obj_t *devoptions_row;
+
+void settings_refresh_devoptions(void) {
+	if (!devoptions_row) {
+		return;
+	}
+	if (systempage_devoptions_unlocked()) {
+		lv_obj_set_hidden(devoptions_row, false);
+	} else {
+		lv_obj_set_hidden(devoptions_row, true);
+	}
+}
+
+// ---------------------------------------------------------------------------
+// More: the things that fit nowhere else
+//
+// The in-line remote keys and the remapping of the three side buttons: both
+// touched rarely enough not to earn a row on the main settings page.
+// ---------------------------------------------------------------------------
+
+// Keyboard type, QWERTY or T9, as pills (the same shape used for the clock
+// position). The setting applies to every keyboard in the player and takes
+// effect immediately via keyboard_refresh_type().
+static lv_obj_t *kbtype_buttons[2]; // 0 = QWERTY, 1 = T9
+
+static void refresh_kbtype_buttons(void) {
+	int active = config_get_int("other", "keyboard_t9", 0) != 0 ? 1 : 0;
+	for (int i = 0; i < 2; i++) {
+		settingsrow_pill_active(kbtype_buttons[i], i == active);
+	}
+}
+
+static void kbtype_pick_cb(lv_event_t *e) {
+	if (switcher_back_drag_active()) {
+		return;
+	}
+	int t9 = (int)(intptr_t)lv_event_get_user_data(e);
+	config_set_int("other", "keyboard_t9", t9);
+	config_save();
+	keyboard_refresh_type();
+	refresh_kbtype_buttons();
+}
+
+// Screenshots, on the keys shown under the switch.
+static lv_obj_t *screenshot_switch;
+
+// Volume steps: how far one press of a volume key moves the volume, from
+// VOLUME_STEP_MIN to VOLUME_STEP_MAX percent. Position 0 of the slider is the
+// smallest step.
+static lv_obj_t *volume_step_slider;
+static lv_obj_t *volume_step_value;
+
+static int volume_step_setting(void) {
+	int step = (int)config_get_int("other", "volume_step", VOLUME_STEP_MIN);
+	if (step < VOLUME_STEP_MIN) {
+		return VOLUME_STEP_MIN;
+	}
+	return step > VOLUME_STEP_MAX ? VOLUME_STEP_MAX : step;
+}
+
+static void volume_step_changed_cb(lv_event_t *e) {
+	(void)e;
+	int step = VOLUME_STEP_MIN + (int)lv_slider_get_value(volume_step_slider);
+	if (step == volume_step_setting()) {
+		return;
+	}
+	config_set_int("other", "volume_step", step);
+	config_save();
+	input_set_volume_step(step);
+	lv_label_set_text_fmt(volume_step_value, "%d", step);
+}
+
+static void screenshot_toggled_cb(lv_event_t *e) {
+	(void)e;
+	screenshot_set_enabled(lv_obj_has_state(screenshot_switch, LV_STATE_CHECKED));
+}
+
+static void build_other_page(gui_config_t *cfg) {
+	othersettings_screen = lv_obj_create(NULL);
+	lv_obj_t *container = settingsrow_page(othersettings_screen, cfg, "more");
+
+	settingsrow_toggle(container, "settings_in_line_remote", &headset_switch, headset_toggled_cb);
+	if (headset_controls_enabled()) {
+		lv_obj_add_state(headset_switch, LV_STATE_CHECKED);
+	}
+
+	settingsrow_add(container, "remap_buttons", NULL, switch_screen_cb, remap_screen);
+
+	settingsrow_slider(container, "settings_volume_steps", VOLUME_STEP_MAX - VOLUME_STEP_MIN + 1, &volume_step_value,
+					   &volume_step_slider, volume_step_changed_cb);
+	int step = volume_step_setting();
+	lv_slider_set_value(volume_step_slider, step - VOLUME_STEP_MIN, LV_ANIM_OFF);
+	lv_label_set_text_fmt(volume_step_value, "%d", step);
+	input_set_volume_step(step);
+	settingsrow_add(container, "control_centre", NULL, switch_screen_cb, ccsettings_screen);
+
+	// Which alphabets the keyboard can be laid out in, above the shape of the
+	// keys: the letters matter more than whether they come ten to a row or
+	// three to a key.
+	settingsrow_add(container, "keyboard_layout", NULL, switch_screen_cb, kblayoutpage_screen);
+
+	// Keyboard type: the two pills on a card, like the clock position.
+	lv_obj_t *kb_pills = NULL;
+	settingsrow_pills(container, "settings_keyboard_type", &kb_pills);
+	kbtype_buttons[0] = settingsrow_pill_text(kb_pills, "QWERTY", 0, kbtype_pick_cb);
+	kbtype_buttons[1] = settingsrow_pill_text(kb_pills, "T9", 1, kbtype_pick_cb);
+	refresh_kbtype_buttons();
+	theme_register_refresh(refresh_kbtype_buttons);
+
+	// Screenshots: the option carries the key combination inside its card,
+	// under its name. Without it the switch would enable something without
+	// saying how to use it.
+	settingsrow_switch_card(container, "devoptions_enable_screenshots", "devoptions_screenshot_keys", &screenshot_switch,
+							screenshot_toggled_cb);
+	if (screenshot_enabled()) {
+		lv_obj_add_state(screenshot_switch, LV_STATE_CHECKED);
+	}
+
+	switcher_attach_back_gesture(othersettings_screen);
+}
+
+// ---------------------------------------------------------------------------
+// The settings list itself
+//
+// 2.0: every row a card that says where it leads and, where there is one
+// worth knowing before going in, what is set there now -- "Appearance · Dark",
+// "Screen · 30 seconds", "Language · English" -- with the chevron after it,
+// so the page answers the commonest question without a tap. The values are
+// read again each time the page comes up: all three can change elsewhere
+// (the theme from the control centre's long press, the language from the
+// first-boot panel), and three label writes cost nothing.
+// ---------------------------------------------------------------------------
+
+static lv_obj_t *appearance_value;
+static lv_obj_t *screen_value;
+static lv_obj_t *language_value;
+
+static lv_obj_t *nav_card(lv_obj_t *parent, const char *tag, lv_event_cb_t cb, void *user, lv_obj_t **value_out) {
+	lv_obj_t *card = sx_card_create(parent);
+	sx_card_title(card, tr(tag));
+	if (value_out) {
+		*value_out = sx_card_value(card, "");
+	}
+	sx_card_chevron(card);
+	sx_card_on_click(card, cb, user);
+	return card;
+}
+
+static void refresh_values(void) {
+	if (appearance_value) {
+		lv_label_set_text(appearance_value, tr(theme_is_dark() ? "appearance_dark" : "appearance_light"));
+	}
+	if (screen_value) {
+		lv_label_set_text(screen_value, tr(SCREEN_OFF[screen_off_index()].label));
+	}
+	if (language_value) {
+		char label[64];
+		lang_display_name(lang_current(), label, sizeof(label));
+		lv_label_set_text(language_value, label);
+	}
+}
+
+static void settings_loaded_cb(lv_event_t *e) {
+	(void)e;
+	refresh_values();
+}
+
+void settings_init(gui_config_t *cfg) {
+	lv_obj_t *container = settingsrow_page(settings_screen, cfg, "settings");
+	container = sx_card_nav_group(container);
+
+	build_screen_page(cfg);
+	build_other_page(cfg);
+
+	nav_card(container, "appearance", switch_screen_cb, appearance_screen, &appearance_value);
+	// Music's own settings (playback, EQ, DAC filters, scan options...). The
+	// gear in the Music header that used to lead there is gone in 2.0 (no
+	// header button repeating a page), so this row is the way in now -- next
+	// to Appearance, the other page people come to Settings for.
+	nav_card(container, "music", switch_screen_cb, musicsettings_screen, NULL);
+	nav_card(container, "settings_screen", switch_screen_cb, screensettings_screen, &screen_value);
+	nav_card(container, "date_and_time", clock_clicked_cb, NULL, NULL);
+	nav_card(container, "power", switch_screen_cb, powersettings_screen, NULL);
+	// Its title is two languages' words joined (language.c), which the page
+	// that owns it keeps up to date.
+	lv_obj_t *language_card = nav_card(container, "language", switch_screen_cb, language_screen, &language_value);
+	language_bind_menu_row(sx_card_title(language_card, tr("language")));
+
+	nav_card(container, "more", switch_screen_cb, othersettings_screen, NULL);
+	nav_card(container, "system", switch_screen_cb, systempage_screen, NULL);
+	// Hidden until the build number in System > Info is tapped five times.
+	// Built regardless, so unlocking is a visibility change rather than a
+	// rebuild of the page.
+	devoptions_row = nav_card(container, "developer_options", switch_screen_cb, devoptions_screen, NULL);
+	settings_refresh_devoptions();
+
+	refresh_values();
+	lv_obj_add_event_cb(settings_screen, settings_loaded_cb, LV_EVENT_SCREEN_LOADED, NULL);
+}

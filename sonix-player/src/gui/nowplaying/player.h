@@ -1,0 +1,198 @@
+#ifndef PLAYER_H
+#define PLAYER_H
+
+#include "src/gui/nowplaying/cover.h"
+#include "src/gui/shell/gui.h"
+#include "src/system/library/library.h"
+#include "src/system/streaming/podcast.h" // podcast_feed_t
+
+#include "lvgl/lvgl.h"
+
+extern lv_obj_t *player_screen;
+
+// Detailed audio chain, opened from the player's menu.
+void player_chain_open(void);
+
+void player_init(gui_config_t *cfg);
+
+// Start playing the given file and switch its now-playing info in the UI.
+// Does not bring the player up; call player_sheet_open() separately.
+void player_play_file(const char *filepath);
+
+// Re-reads the loaded track and repaints the now-playing UI. For callers
+// that set up playback through device_state directly (queue jumps, list
+// playback).
+void player_refresh_now_playing(void);
+
+// Redraws only the artist line, after "Use track artist" has been switched.
+void player_refresh_artist(void);
+
+// Reads the lyrics of `path` again, once an .lrc has been saved beside it, and
+// brings their page in when it is the file playing.
+void player_lyrics_reload(const char *path);
+
+// The "4/12" under the progress bar: the place in the queue as the screen shows
+// it (the deal's order under shuffle) and the length. False, with both zero,
+// where the screen shows nothing -- one track, a book, DLNA, a stream.
+bool player_queue_position(int *position, int *count);
+
+// Whether the standard player takes its accent from the cover.
+bool player_cover_accent(void);
+void player_cover_accent_set(bool on);
+
+// The output the music was going to has just been unplugged -- a jack pulled
+// out, a USB-C DAC removed, headphones that walked out of range. Pauses, so
+// that taking the headphones off does not cost three tracks of an album, and
+// so that nothing is left playing into a socket with nothing in it.
+//
+// Does nothing unless something is actually playing. `what` names the output
+// for the log and is not shown to anyone. Callers decide whether the output
+// that went away was the one in use; this only acts on the decision.
+void player_output_unplugged(const char *what);
+
+// ---------------------------------------------------------------------------
+// The player as a sheet
+//
+// The player is not a page you navigate to but a panel over whatever page is
+// on screen. Since 2.0 it comes up from the bottom -- the mini player's tap or
+// upward swipe (sx_mini.h), or anything that switches to player_screen -- and
+// goes back down: the chevron (pointing down now) or a pull down past
+// SX_NP_COLLAPSE_PX, which it follows. It is an object on the top layer
+// rather than an LVGL screen, so it can be drawn over the page it came up on.
+// ---------------------------------------------------------------------------
+
+// The hardware transport keys, dispatched here from the button threads.
+void player_key_play_pause(void);
+void player_key_next(void);
+void player_key_prev(void);
+// The side buttons' remappable extras (keymap.h). Each says what it did in a
+// toast, since the player is usually in a pocket when they are pressed.
+void player_key_favourite(void);  // the star, add only: never takes one off
+void player_key_next_album(void); // device_state_next_album()
+void player_key_cycle_mode(void); // the repeat/shuffle button
+
+// What the player's on-screen prev/next buttons do: seconds-sized skips on an
+// audiobook or podcast, previous/next track otherwise. The control centre
+// calls these so that it behaves exactly like the player.
+void player_screen_prev(void);
+void player_screen_next(void);
+
+// The feed of the episode being played, for the control centre's star button.
+// Returns true and fills id/feed when a podcast is playing.
+bool player_current_podcast_feed(long long *id_out, podcast_feed_t *feed_out);
+
+bool player_sheet_is_open(void);
+
+// True while the gesture in progress has been claimed as the pull down. Tap
+// handlers check this so that the end of a drag does not also press a button.
+bool player_sheet_drag_active(void);
+void player_sheet_open(bool animate);
+void player_sheet_close(bool animate);
+// Mini-player pull and left-edge Back reuse the existing sheet and LVGL animations.
+bool player_sheet_pull_begin(int visible_height);
+void player_sheet_pull_update(int up);
+void player_sheet_pull_end(bool open);
+bool player_sheet_edge_back_allowed(void);
+void player_sheet_edge_back_begin(void);
+void player_sheet_edge_back_update(int dx);
+void player_sheet_edge_back_end(bool close);
+
+// Makes `obj` a place the sheet can be dragged from. `opening` false: a
+// surface of the sheet itself, which pulls it down. `opening` true was a page
+// surface that pulled the player in with a leftward drag before 2.0; that is
+// the mini player's job now, and the call only makes `obj` clickable.
+void player_sheet_attach_drag(lv_obj_t *obj, bool opening);
+
+// Boot-time "Remember track": loads the remembered track, paused at position.
+void player_restore_track(const char *filepath, double position);
+
+// The boot-time restore of a queue that was a library list: the handle takes
+// the place of the list of paths, so next/prev work from the first press
+// instead of landing back on the remembered track. Takes ownership of `ix`.
+void player_restore_index(library_index_t *ix, int start_index, const char *const *extra, const int *extra_slots, int extra_count, const char *filepath, double position);
+
+// The same for a queue saved as a plain list of paths. `custom` restores the
+// queue's own custom flag, which the list of paths on its own cannot carry.
+void player_restore_list(const char *const *list, int count, int start_index, bool custom, const char *filepath, double position);
+
+// The loaded track's artwork, already decoded and scaled by the player: the
+// cover itself, and the blurred copy the controls are drawn on. NULL when the
+// track has no artwork (or its decode has not landed yet). Borrowed, not
+// owned -- the player frees these at the next track change, so nothing may
+// keep them across one.
+const lv_image_dsc_t *player_cover_image(void);
+uint32_t player_cover_generation(void);
+uint32_t player_backdrop_generation(void);
+const lv_image_dsc_t *player_backdrop_image(void);
+
+// Registers a callback run immediately before that artwork is freed, so
+// whoever borrowed it can drop its references first. One at a time; NULL
+// clears it.
+void player_set_cover_release_cb(void (*cb)(void));
+
+// The size the standard arrangement draws the cover at. A page that shows the
+// same cover asks for it at this size, so the player's table of covers serves
+// both (coverloader_request_shared). 0 x 0 before the player is built.
+void player_cover_box(int *w, int *h);
+
+// The cover the player shows now, scaled to a square of `size`, with its
+// colour; `id` is the picture's cover_source_id(), 0 while not known yet.
+// False with no cover up, or one still on its way.
+bool player_cover_copy(int size, cover_image_t *out, uint64_t *id);
+
+// The status bar kept up over the player too (Settings > Appearance > Always
+// show the status bar). Not saved here: the settings page writes the config.
+void player_set_statusbar_always(bool on);
+bool player_statusbar_always(void);
+
+// ---------------------------------------------------------------------------
+// Sonix UI 2.0: what the player's menu and the queue page ask of it
+//
+// All UI thread.
+// ---------------------------------------------------------------------------
+
+// The queue changed under the player (an edit on the queue page, an undo, a
+// list queued from elsewhere): "Up next · X" and the "3/12" under the bar are
+// read again. Cheap; the poll catches anything not told.
+void player_queue_changed(void);
+// Refresh only mini-specific artwork demand after its display mode changes.
+void player_mini_mode_changed(void);
+
+// A preview owns a fixed track/chapter range, not the decoder or its position.
+// Only commit seeks; an invalidated preview never acts on a replacement track.
+typedef struct {
+	double position, start, length, total;
+	unsigned revision;
+} player_mini_seek_t;
+bool player_mini_seek_begin(player_mini_seek_t *preview);
+bool player_mini_seek_valid(const player_mini_seek_t *preview);
+bool player_mini_seek_commit(const player_mini_seek_t *preview, double position);
+
+// What plays outside the queue (the handoff's `ext`): a station, a book, a
+// phone over AirPlay, DLNA or the Bluetooth receiver. True with its title in
+// `out`; false while the queue's own track plays.
+bool player_outside_title(char *out, size_t size);
+
+// One shared named choice for queue order/repeat, from the player or menu.
+void player_playback_mode_menu(void);
+// Existing shuffle API retains repeat when changing order.
+bool player_shuffle_on(void);
+void player_shuffle_toggle(void);
+
+// The words (lyrics): whether the playing file can have them (a file on the
+// card that is not a book), whether they are up, and up or away. The menu's
+// "Lyrics" line -- the swipe on the artwork that pulled them in before 2.0 is
+// the previous/next track now. Wanted, they stay up from one track to the
+// next, as before.
+bool player_lyrics_available(void);
+bool player_lyrics_shown(void);
+void player_lyrics_toggle(void);
+
+// "Sleep timer" for the menu: its label with what is set ("Sleep timer · 30
+// min"), and its sheet (off / 15 / 30 / 60 min / at the end of the track) --
+// the three timers of sleeptimer.h, the one that belongs to what is playing,
+// so the settings, the control centre and the moon in the status bar agree.
+const char *player_sleep_label(void);
+void player_sleep_sheet_open(void);
+
+#endif

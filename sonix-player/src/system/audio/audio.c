@@ -1,0 +1,6438 @@
+#include "audio.h"
+#include "src/system/audio/alsa-controls.h"
+#include "src/system/audio/decimate.h"
+#include "src/system/audio/eq.h"
+#include "src/system/audio/replaygain.h"
+#include "src/system/audio/resample.h"
+#include "src/system/audio/speed.h"
+#include "src/system/audio/swvolume.h"
+#include "src/system/audio/usbaudio.h"
+#include "src/system/bluetooth/bluetooth.h"
+#include "src/system/core/config.h"
+#include "src/system/core/utils.h"
+#include "src/system/decode/decode.h"
+#include "src/system/decode/growfile.h"
+#include "src/system/decode/sndfile.h"
+#include "src/system/device/power.h"
+#include <stdatomic.h>
+
+#include <pthread.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <strings.h>
+#include <stdarg.h>
+#include <errno.h>
+#include <unistd.h>
+
+#include <sched.h>
+#include <poll.h>
+#include <sys/eventfd.h>
+#include <sys/prctl.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
+#include <dirent.h>
+#include <alloca.h>
+#include <alsa/asoundlib.h>
+#include <time.h>
+
+// Millisecond timestamps for the play/start/end log lines, so the ordering and
+// the gaps between them can be read back.
+static long log_ms(void) {
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+
+// The host build has no sound card: ALSA falls back to a null device that
+// swallows a whole track in a few milliseconds, so playback there is over
+// before it starts and states like "paused" are unreachable. Pacing the writes
+// to real time makes the simulator behave like a device for anything that
+// depends on timing.
+#ifdef HOST_BUILD
+static void host_pace(snd_pcm_sframes_t frames, int rate) {
+	if (frames > 0 && rate > 0) {
+		usleep((useconds_t)((frames * 1000000.0) / rate));
+	}
+}
+#else
+#define host_pace(frames, rate) ((void)0)
+#endif
+
+// Stops a stream for a pause, and says how many bytes of already-decoded audio
+// were thrown away with it.
+//
+// The stream is DROPPED, not paused. This driver does not survive
+// snd_pcm_pause(): a track left paused and then skipped wedges the playback
+// thread inside ALSA until the player is restarted. The stock player cannot
+// pause the hardware either -- it runs on tinyalsa, which has no pause call at
+// all, and simply stops feeding the device.
+//
+// The cost of dropping is that whatever the DAC had buffered (up to ~0.7 s with
+// the deep buffer here) is discarded unheard, so the caller winds its source
+// back by the returned amount.
+// One per turn of a decode loop, for the watchdog.
+//
+// The playback thread runs SCHED_RR while its stream plays (see
+// playback_follow), and this device has one core: a turn that
+// never blocks starves everything else, the interface included, and the log
+// stops because nothing else is scheduled to write to it. From outside that is
+// a frozen player with nothing in the log -- and from the watchdog's side a
+// thread in state R says only "running", not whether it is making progress.
+// This number says which: racing away while the interface is stalled is a spin,
+// standing still is a thread stuck in a call that never came back.
+static volatile unsigned loop_turns;
+
+unsigned audio_loop_turns(void) { return loop_turns; }
+
+static int64_t pause_stop_stream(snd_pcm_t *pcm, int frame_bytes) {
+	// No stream is a fair answer, not a fault: the device is handed back after
+	// a few seconds of pause and this is called on the way into pause. Alsa
+	// would answer a null handle with an assert, and an abort in here costs the
+	// whole audio thread.
+	if (!pcm) {
+		return 0;
+	}
+
+	snd_pcm_sframes_t queued = 0;
+	if (snd_pcm_delay(pcm, &queued) < 0 || queued < 0) {
+		queued = 0; // buffered amount unknown: resume a touch late
+	}
+
+	snd_pcm_drop(pcm);
+
+	fprintf(stderr, "audio[%ld]: paused (stream dropped, %ld frames unplayed)\n", log_ms(), (long)queued);
+	return (int64_t)queued * frame_bytes;
+}
+
+// Resuming from pause must cope with whatever happened to the PCM while it sat
+// paused: a long screen-off can leave it SUSPENDED (or dropped back to SETUP),
+// and a write to a device still stuck in PAUSED blocks forever with no error.
+// Whatever the state, this leaves the stream RUNNING or freshly PREPARED so the
+// next write starts it.
+static void pcm_restart_after_pause(snd_pcm_t *pcm) {
+	snd_pcm_state_t st = snd_pcm_state(pcm);
+
+	// A system suspend can leave the device suspended underneath; that has to
+	// be undone before anything else will work.
+	if (st == SND_PCM_STATE_SUSPENDED) {
+		int err = snd_pcm_resume(pcm);
+		int tries = 0;
+		while (err == -EAGAIN && tries++ < 10) {
+			usleep(100 * 1000);
+			err = snd_pcm_resume(pcm);
+		}
+	}
+
+	// The stream was DROPPED when the pause began (see the pause branch), so
+	// there is nothing to un-pause: it just needs preparing again before the
+	// next write.
+	int err = snd_pcm_prepare(pcm);
+	fprintf(stderr, "audio[%ld]: restarting after pause (state %d, prepare %s)\n", log_ms(), (int)st,
+			err < 0 ? snd_strerror(err) : "ok");
+}
+
+
+// The sample encodings the WAV path reads. The device is opened at S16_LE for
+// the first two and at S32_LE, left-justified, for the rest -- the same format
+// the decoded path uses for 24-bit sources.
+typedef enum {
+	WAV_PCM_U8,
+	WAV_PCM_S16,
+	WAV_PCM_S24, // packed, three bytes a sample
+	WAV_PCM_S32,
+	WAV_FLOAT32,
+	WAV_FLOAT64,
+} wav_sample_t;
+
+typedef struct {
+	int channels;
+	int sample_rate;
+	int bits_per_sample; // as stored in the file, for the format line
+	wav_sample_t sample;
+	int src_frame_bytes; // one frame as stored in the file
+	int out_bits;		 // 16 or 32: what the device is opened with
+	// 64-bit: long is 32 bits on the device, and a 24/96 stereo file passes
+	// 2 GB after about an hour.
+	int64_t data_offset;
+	int64_t data_size;
+} wav_info_t;
+
+// parse_wav() results.
+#define WAV_OK 0
+#define WAV_BAD -1		   // not a WAV, or a broken one
+#define WAV_UNSUPPORTED -2 // a sound WAV in an encoding this path does not read
+
+// The ALSA device playback opens. "default" is the DAC behind the jacks;
+// Bluetooth swaps in a bluealsa PCM name so the stream goes to the
+// headphones instead. Read under the mutex, because it is set from the
+// interface thread while the playback thread may be about to open a file.
+// It gets a lock of its own rather than sharing audio_mutex: open_pcm_device()
+// runs on the playback thread at points where that mutex is already held, and
+// a second acquisition there would be a deadlock rather than a bug report.
+#define AUDIO_DEFAULT_PCM "default"
+static char output_pcm[160] = AUDIO_DEFAULT_PCM;
+
+// ---------------------------------------------------------------------------
+// 32-bit samples on the built-in card
+//
+// The card's DMA driver (soc_aic.ko) takes S16_LE and S24_LE and nothing
+// else. Asked for S32_LE, the "default" plug converts to S24_LE itself, and
+// a plug that converts reaches the card through mmap: it writes the converted
+// samples straight into the DMA buffer, mapped into this process by the
+// driver's own aic_dma_pcm_mmap() -- a remap_pfn_range() over the buffer's
+// pages with the cache attribute bits cleared. The stock player never takes
+// that path: it imports snd_pcm_writei and none of the mmap calls.
+//
+// Twice now the kernel has died on memory overwritten with values shaped
+// exactly like that conversion's output -- 0x003693ef in an anon_vma pointer,
+// then 0x007f20d0 over kernel code, 24-bit samples in 32-bit words -- both
+// times on a player that had been playing 24-bit tracks through it. So the
+// card is asked for S24_LE directly, the samples are shifted here, and the
+// plug, with nothing to convert, passes plain writes through to the driver's
+// copy path, the one the stock player has always used.
+//
+// The shift is the plug's own, checked against alsa-lib byte for byte: an
+// arithmetic shift of the 32-bit word by eight, sign carried into the top
+// byte, which leaves a DoP marker and its sixteen bits exactly where the DAC
+// has always found them.
+// ---------------------------------------------------------------------------
+
+// Whether 32-bit frames for `pcm` go out as S24_LE. Decided from the handle's
+// own name, so it is right for a handle that fell back to the card.
+static bool pcm_takes_s24(snd_pcm_t *pcm, int bits) {
+	const char *name = (pcm && bits == 32) ? snd_pcm_name(pcm) : NULL;
+	return name && strcmp(name, AUDIO_DEFAULT_PCM) == 0;
+}
+
+typedef struct {
+	int32_t *data;
+	size_t capacity; // in samples
+} s24_scratch_t;
+
+// The frames shifted into S24_LE, in `scratch`. The caller's buffer is left
+// alone: a write that is retried after an underrun hands the same buffer in
+// again. NULL when the scratch cannot be grown.
+static const void *s24_from_s32(s24_scratch_t *scratch, const void *buf, size_t samples) {
+	if (samples > scratch->capacity) {
+		int32_t *grown = realloc(scratch->data, samples * sizeof(int32_t));
+		if (!grown) {
+			return NULL;
+		}
+		scratch->data = grown;
+		scratch->capacity = samples;
+	}
+	const int32_t *in = buf;
+	for (size_t i = 0; i < samples; i++) {
+		scratch->data[i] = in[i] >> 8;
+	}
+	return scratch->data;
+}
+
+// One each for the decode loop and the external sources, which write from
+// threads of their own.
+static s24_scratch_t playback_s24;
+static s24_scratch_t external_s24;
+
+static pthread_mutex_t output_lock = PTHREAD_MUTEX_INITIALIZER;
+static bool output_device_set_if(const char *expected, const char *pcm);
+
+static pthread_t playback_thread;
+static pthread_mutex_t audio_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t audio_cond = PTHREAD_COND_INITIALIZER;
+
+static audio_command_t audio_command = AUDIO_CMD_NONE;
+// Commands arriving during an unlocked resume must win, even a pause/resume
+// pair that leaves the command value unchanged. Protected by audio_mutex.
+static unsigned resume_request_serial;
+static audio_status_t playback_status = AUDIO_STATUS_STOPPED;
+static char current_filepath[512] = {0};
+static bool play_request = false;
+// When the pending play request was made. The playback thread clears it as it
+// picks the request up, so a value that stops moving is a thread that has
+// stopped coming back for work -- which is what a stall looks like from
+// outside: the interface answers, the request is logged, and no track starts.
+// Read by the watchdog in main.c.
+static long play_request_ms;
+static bool write_fail_retry_used = false; // one automatic track retry per play request
+
+// What audio_quiet_ms() reads: whether a track is being started or a PCM is
+// being opened right now, and when the last of those finished. Written by the
+// playback thread, read without a lock from the waveform worker -- each is a
+// word wide on this target, so the worst a racing read sees is the state from
+// an instant ago.
+static volatile bool track_starting;
+static volatile bool pcm_opening;
+static volatile long quiet_since_ms;
+
+// Error and the last attempted PCM kind belong to the caller, not a global slot:
+// an external open can overlap a local request waiting to take its output.
+typedef struct {
+	int code;
+	bool bt_ordinary_endpoint;
+} pcm_open_error_t;
+
+// Set by audio_notify_resume(): a system suspend leaves an open stream in
+// SND_PCM_STATE_SUSPENDED, and a paused track keeps its stream open across
+// the whole standby. The playback thread clears the flag by putting the
+// device back on its feet, so nothing later meets a suspended handle.
+static bool resume_recover_pending = false;
+
+// Raised by the suspend path: as soon as the playback thread sees it, it
+// closes the PCM the gapless path is holding instead of waiting for it to
+// time out.
+static volatile bool hold_flush_request = false;
+
+// True while play_file() is running -- including while paused. This is the
+// distinction "playback_status == STOPPED" cannot make: the status changes as
+// soon as the command arrives, but the track context (open decoder, FILE* on
+// the card, thread inside the track loop) only dies when play_file() returns.
+// The suspend path waits on this, not on the status: the microSD loses power
+// in mem, and a descriptor left open across it leads to the reboot on the
+// first play afterwards.
+static volatile bool playback_context_active = false;
+
+// Fresh restart after mem: the first play is not an unpause. The stock binary
+// has a dedicated flag (player+0xBB8, set_param(0x1e,1) just before mem) that
+// the next play consumes to rebuild the track instead of resuming a
+// pre-suspend state. Same idea here: path and position are saved before the
+// freeze, and the next audio_resume() turns them into an audio_play_at() --
+// fresh decoder, fresh output route, fresh PCM.
+static bool restart_fresh_pending = false;
+static char restart_fresh_path[512];
+static double restart_fresh_pos;
+
+// ---------------------------------------------------------------------------
+// Re-initialising the output route after waking from mem.
+//
+// mem powers the HBC3000 (the FPGA audio bridge) off, and the card's
+// suspend_pre resets the driver's route to 0. The first route write after it
+// is therefore a real change, which runs hbc3000_enable(): power, the FPGA
+// configuration loaded over JTAG, the DAC powered up. A PCM opened before that
+// write starts the HBC3000 dead, the AIC reset fails and the device reboots.
+//
+// The write takes a few hundred milliseconds in the driver, so on the R3 Pro II
+// it runs on a low-priority thread while the screen comes back. The card is
+// closed to everything else (alsa_wait_output_reinit()) from the parking of
+// the route before mem until the write and the DAC level are done.
+// ---------------------------------------------------------------------------
+
+// On the thread that called alsa_output_reinit_enter_thread().
+static void output_reinit_now(void) {
+	long start = log_ms();
+	alsa_controls_rewrite_output();
+	// The DAC back once the real route is live again.
+	alsa_suspend_restore();
+	fprintf(stderr, "audio: output re-init after resume done in %ld ms\n", log_ms() - start);
+}
+
+static void *output_reinit_thread(void *unused) {
+	(void)unused;
+	alsa_output_reinit_enter_thread();
+	thread_be_low_priority("outreinit");
+	output_reinit_now();
+	alsa_output_reinit_leave_thread();
+	alsa_output_reinit_end();
+	return NULL;
+}
+
+void audio_start_output_reinit_after_resume(void) {
+	// No HBC3000 on the CS43131 board: nothing went down, nothing to re-init.
+	if (alsa_board_is_cs43131()) {
+		alsa_suspend_restore();
+		return;
+	}
+	fprintf(stderr, "audio: output re-init after resume, route %d, in the background\n", detect_output());
+
+	// Closed already by the parking before mem; closed here otherwise.
+	alsa_output_reinit_begin();
+	pthread_attr_t attr;
+	pthread_t thread;
+	pthread_attr_init(&attr);
+	pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+	int err = pthread_create(&thread, &attr, output_reinit_thread, NULL);
+	pthread_attr_destroy(&attr);
+	if (err != 0) {
+		fprintf(stderr, "audio: no thread for the output re-init (%s); done here\n", strerror(err));
+		alsa_output_reinit_enter_thread();
+		output_reinit_now();
+		alsa_output_reinit_leave_thread();
+		alsa_output_reinit_end();
+	}
+}
+
+// The pop into the headphones as the R3 Pro II goes into mem.
+//
+// mem cuts the HBC3000's power with its output stage still switched on to the
+// socket, and the amplifier losing its supply with the headphones connected is
+// the thump. The mixer offers no mute for that stage -- the card's controls are
+// the route, the balanced line-out flag and DOP_EN, the codec's are before the
+// amplifier -- but a route change is the machine driver's own orderly sequence
+// (mute the old port, reconfigure, unmute the new one), and it is silent: the
+// route write at every wake runs the same sequence and nobody hears it.
+//
+// So before the suspend the route is moved to the other socket, the empty one.
+// The port in use is muted by the driver, and what goes down in mem is an
+// amplifier driving nothing. The re-init above puts the real route back.
+//
+// Called with the PCM closed: audio_suspend_freeze() has run. Closes the card
+// to everything but the re-init that follows the suspend, or the attempt.
+void audio_park_output_before_suspend(void) {
+	if (alsa_board_is_cs43131()) {
+		return; // no HBC3000, and no thump to take away
+	}
+	alsa_wait_output_reinit(); // the last wake's re-init, if still running
+	int x = detect_output();
+	if (x < 1 || x > 3) {
+		alsa_output_reinit_begin();
+		return; // not one of the analogue sockets
+	}
+	int y = output_reinit_partner(x);
+	// The DAC first: the route change mutes the old port, but the DAC feeding
+	// it would still be live when its supply goes. Silent until the wake has
+	// put the real route back (audio_start_output_reinit_after_resume()).
+	alsa_suspend_mute();
+	// The balanced line-out flag with it: on the 4.4 mm socket headphone and
+	// line out are the same route, and a report of a pop has to say which.
+	fprintf(stderr, "audio: output parked on %d before mem (was %d, balanced line out %d)\n", y, x, alsa_output_key() & 1);
+#ifndef HOST_BUILD
+	alsa_set_control("Output Port Switch", y);
+	usleep(120 * 1000); // the driver's mute and route change, before the power goes
+	alsa_controls_note_output(y);
+#endif
+	alsa_output_reinit_begin();
+}
+
+// True while the playback thread holds an open PCM handle. The suspend path
+// waits on this: no ALSA object may be alive when the SoC stops.
+static volatile bool pcm_device_open = false;
+
+// How long a paused stream may keep the device -- and with it the CS43198 and
+// the amplifier -- powered before it is handed back. The usual way to leave the
+// player is a track paused, and holding the whole analogue chain up for hours
+// is the bulk of the standby drain. The stock player closes its device whenever
+// it is not feeding it, which is why its "pop" is a familiar sound on these
+// players.
+#define PAUSED_DEVICE_CLOSE_MS 5000
+
+// True when the stream is going out over Bluetooth rather than to the DAC.
+static bool output_is_bluetooth(void) {
+	char device[sizeof(output_pcm)];
+	audio_get_output_device(device, sizeof(device));
+	return strncmp(device, "bluealsa", 8) == 0;
+}
+
+// ...and over Bluetooth the wait is zero.
+//
+// bluealsa's PCM is not a sound card. The A2DP transport is acquired when the
+// stream starts and released the moment it is dropped, and snd_pcm_prepare()
+// does not take it back: writes after an unpause are accepted by the plugin and
+// go nowhere.
+//
+// So on Bluetooth the pause hands the device back immediately and the unpause
+// opens a fresh stream, which is the same path a track change takes. Nothing is
+// lost by it: there is no DAC to keep warm at that end of the link.
+static long paused_device_close_ms(void) { return output_is_bluetooth() ? 0 : PAUSED_DEVICE_CLOSE_MS; }
+
+// Set while the metronome waits for the output that a paused track still holds
+// (audio_external_begin_yielding): the pause hands it back at its next check
+// rather than when PAUSED_DEVICE_CLOSE_MS is up.
+static atomic_bool paused_release_wanted;
+
+bool audio_output_is_bluetooth(void) { return output_is_bluetooth(); }
+
+// ---------------------------------------------------------------------------
+// "Dissolvenza": the volume ramp at each end of a track.
+//
+// One decoder, one stream: two tracks cannot overlap the way a mixing desk
+// would cross-fade them, so this is the honest version of the effect -- the
+// last seconds of a track ramp down to silence and the first seconds of the
+// next ramp up from it. Back to back, that is what a listener hears as a
+// cross-fade.
+//
+// The gain is Q10 fixed point (1024 = unity): plain integer multiplies on the
+// sample, no floating point anywhere near the per-sample path.
+// ---------------------------------------------------------------------------
+
+static volatile bool fade_enabled;
+static volatile int fade_secs = 3;
+static volatile bool bit_perfect;
+
+void audio_set_fade(bool enabled, int seconds) {
+	if (seconds < 1) {
+		seconds = 1;
+	}
+	if (seconds > 12) {
+		seconds = 12;
+	}
+	fade_enabled = enabled;
+	fade_secs = seconds;
+	fprintf(stderr, "audio: fade %s (%d s)\n", enabled ? "on" : "off", seconds);
+}
+
+// 0..1024 for a position in the track. Unity everywhere but the two ends.
+static int fade_gain_q10(double pos_secs, double total_secs) {
+	if (!fade_enabled) {
+		return 1024;
+	}
+
+	double span = (double)fade_secs;
+	int gain = 1024;
+
+	if (pos_secs < span) {
+		int in_gain = (int)((pos_secs / span) * 1024.0);
+		gain = in_gain < gain ? in_gain : gain;
+	}
+	if (total_secs > span * 2 && pos_secs > total_secs - span) {
+		double left = total_secs - pos_secs;
+		int out_gain = left > 0 ? (int)((left / span) * 1024.0) : 0;
+		gain = out_gain < gain ? out_gain : gain;
+	}
+
+	if (gain < 0) {
+		gain = 0;
+	}
+	if (gain > 1024) {
+		gain = 1024;
+	}
+	return gain;
+}
+
+static void fade_apply_s16(short *samples, int count, int gain) {
+	if (gain >= 1024) {
+		return;
+	}
+	for (int i = 0; i < count; i++) {
+		samples[i] = (short)(((int)samples[i] * gain) >> 10);
+	}
+}
+
+static void fade_apply_s32(int32_t *samples, int count, int gain) {
+	if (gain >= 1024) {
+		return;
+	}
+	for (int i = 0; i < count; i++) {
+		samples[i] = (int32_t)(((int64_t)samples[i] * gain) >> 10);
+	}
+}
+static bool stop_thread = false;
+
+static double seek_target_secs = -1.0;
+static bool seek_request = false;
+
+// Set true by the playback thread when a track plays through to its end (as
+// opposed to being stopped/replaced by the user). Consumed via
+// audio_take_completion() so the controller can auto-advance.
+static bool track_completed = false;
+static void (*completion_hook)(void);
+
+void audio_set_completion_hook(void (*hook)(void)) { completion_hook = hook; }
+
+// Marks the end of a track's playback routine. The catch is that tearing down
+// the old track happens *after* audio_play() has already announced the new one
+// (the thread only notices `play_request` once it drops out of its write loop,
+// and snd_pcm_drain() can sit there for a while). Blindly writing STOPPED here
+// would overwrite the new track's PLAYING and leave the UI showing a stopped
+// player for a track that is in fact starting -- so when another file is
+// already queued up, leave the status alone.
+// Caller must hold audio_mutex.
+static void mark_stopped_unless_replaced(void) {
+	if (!play_request) {
+		playback_status = AUDIO_STATUS_STOPPED;
+	}
+}
+
+static double progress_current_secs = 0.0;
+static unsigned progress_serial;
+static unsigned progress_reported_serial;
+
+// Where the bar was when the track was paused.
+//
+// Pausing winds the decoder back over the frames that were queued but never
+// heard, so resuming carries on from the sound and not from the file. That is
+// right for the audio and wrong for the display: the position on screen jumps
+// backwards by however deep the output buffer is, which on this player is most
+// of a second.
+//
+// So the reported position has a floor while the rewind is in effect. The bar
+// stays where the music stopped, resuming replays the buffered moment behind
+// it, and the floor lifts by itself as soon as real progress passes it. -1
+// means no floor.
+static double progress_floor_secs = -1.0;
+
+// The position to report for a file that is being opened: where a seek already
+// waiting for it will put it, or 0. A reopen at the same point -- the output
+// moving to or from the headphones -- is a play and a seek, and reporting 0
+// until the seek is reached drew the bar at the start and back. Caller holds
+// audio_mutex.
+static double opening_position(void) {
+	return seek_request && seek_target_secs > 0 ? seek_target_secs : 0.0;
+}
+
+// The position after a block has gone out, unless a seek has been asked for
+// meanwhile: audio_seek() already reports its target, and the block that was
+// being written when it arrived belongs to the old position. Caller holds
+// audio_mutex.
+static void report_position(double seconds) {
+	if (!seek_request && !play_request) {
+		progress_current_secs = seconds;
+		progress_reported_serial = progress_serial;
+	}
+}
+
+// Playback speed, for audiobooks. It lives here rather than being handed in
+// with the track because it can be changed while one is playing, from the
+// player's own pop-over. 1.0 is untouched and costs nothing: speed.c bypasses
+// itself entirely at that factor.
+static double playback_speed = 1.0;
+
+// What speed.c pulls its input through.
+typedef struct {
+	decoder_t *dec;
+} decoder_fill_t;
+
+static int decoder_fill(void *user, short *dst, int frames) {
+	decoder_fill_t *ctx = user;
+	return (int)decoder_read_pcm_frames_s16(ctx->dec, (uint64_t)frames, dst);
+}
+static double progress_total_secs = 0.0;
+
+static int stream_sample_rate = 0;
+// The rate the output was opened at: the track's own, or what the decimation
+// and the Bluetooth resampler made of it. For the Now Playing line that says
+// when the music is converted on its way to the headphones.
+static int stream_device_rate = 0;
+// Negotiated PCM format, protected by output_lock rather than audio_mutex:
+// output opens run without audio_mutex.
+static audio_output_format_t output_format;
+static char output_format_device[sizeof(output_pcm)];
+static int stream_channels = 0;
+static int stream_bits = 0; // source bit depth (16/24/32), for the format line
+// DSD, for the format line: 64/128/256, or 0 when the track is not DSD. A DSD
+// track's real identity is its multiple, not "24 bit at 176.4 kHz" -- that is
+// only what the carrier looks like.
+static int stream_dsd_multiple = 0;
+// Also for the format line and the details page: what is inside the file and
+// at how many kbps. A lossy format has no bit depth of its own -- see
+// decoder_is_lossy() -- and is described by bitrate instead.
+static int stream_bitrate_kbps = 0;
+static bool stream_lossy = false;
+static char stream_codec[16] = "";
+
+// Little-endian readers for the header fields.
+static uint16_t le16(const unsigned char *p) { return (uint16_t)(p[0] | (p[1] << 8)); }
+static uint32_t le32(const unsigned char *p) {
+	return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+#define WAVE_FORMAT_PCM 0x0001
+#define WAVE_FORMAT_IEEE_FLOAT 0x0003
+#define WAVE_FORMAT_EXTENSIBLE 0xFFFE
+
+static int parse_wav(const char *filepath, wav_info_t *info, FILE **file_out) {
+	FILE *f = fopen(filepath, "rb");
+	if (!f) {
+		fprintf(stderr, "Audio: Failed to open file: %s\n", filepath);
+		return WAV_BAD;
+	}
+
+	memset(info, 0, sizeof(*info));
+
+	unsigned char riff[12];
+	if (fread(riff, 1, sizeof(riff), f) != sizeof(riff) || memcmp(riff, "RIFF", 4) != 0 ||
+		memcmp(riff + 8, "WAVE", 4) != 0) {
+		fclose(f);
+		return WAV_BAD;
+	}
+
+	if (fseeko(f, 0, SEEK_END) != 0) {
+		fclose(f);
+		return WAV_BAD;
+	}
+	int64_t file_end = (int64_t)ftello(f);
+	fseeko(f, (off_t)sizeof(riff), SEEK_SET);
+
+	int tag = 0;
+	int bits = 0;
+	bool have_fmt = false;
+
+	unsigned char head[8];
+	while (fread(head, 1, sizeof(head), f) == sizeof(head)) {
+		uint32_t size = le32(head + 4);
+		int64_t body = (int64_t)ftello(f);
+		if (body < 0) {
+			break;
+		}
+
+		if (memcmp(head, "fmt ", 4) == 0) {
+			// Up to the end of WAVEFORMATEXTENSIBLE: 16 bytes of WAVEFORMAT, the
+			// extension size, valid bits, channel mask and the sub-format GUID,
+			// whose first two bytes are the real format tag.
+			unsigned char fmt[40];
+			size_t want = size < sizeof(fmt) ? size : sizeof(fmt);
+			if (size < 16 || fread(fmt, 1, want, f) != want) {
+				fclose(f);
+				return WAV_BAD;
+			}
+			tag = le16(fmt);
+			info->channels = le16(fmt + 2);
+			info->sample_rate = (int)le32(fmt + 4);
+			bits = le16(fmt + 14);
+			if (tag == WAVE_FORMAT_EXTENSIBLE) {
+				tag = want >= 26 ? le16(fmt + 24) : 0;
+			}
+			have_fmt = true;
+		} else if (memcmp(head, "data", 4) == 0) {
+			info->data_offset = body;
+			// 0 and 0xFFFFFFFF are what a writer leaves when it never went back
+			// to fill the length in, and a length past the end of the file is
+			// a truncated copy: in all three cases the audio runs to the end.
+			int64_t declared = (int64_t)size;
+			if (size == 0 || size == 0xFFFFFFFFu || body + declared > file_end) {
+				declared = file_end - body;
+			}
+			info->data_size = declared;
+			break;
+		}
+
+		// Chunks are padded to an even length.
+		if (fseeko(f, (off_t)(body + (int64_t)size + (size & 1)), SEEK_SET) != 0) {
+			break;
+		}
+	}
+
+	if (!have_fmt || !info->data_offset || info->channels <= 0 || info->channels > 8 || info->sample_rate <= 0) {
+		fclose(f);
+		return WAV_BAD;
+	}
+
+	info->bits_per_sample = bits;
+	if (tag == WAVE_FORMAT_PCM && bits == 8) {
+		info->sample = WAV_PCM_U8;
+	} else if (tag == WAVE_FORMAT_PCM && bits == 16) {
+		info->sample = WAV_PCM_S16;
+	} else if (tag == WAVE_FORMAT_PCM && bits == 24) {
+		info->sample = WAV_PCM_S24;
+	} else if (tag == WAVE_FORMAT_PCM && bits == 32) {
+		info->sample = WAV_PCM_S32;
+	} else if (tag == WAVE_FORMAT_IEEE_FLOAT && bits == 32) {
+		info->sample = WAV_FLOAT32;
+	} else if (tag == WAVE_FORMAT_IEEE_FLOAT && bits == 64) {
+		info->sample = WAV_FLOAT64;
+	} else {
+		fprintf(stderr, "audio: '%s' is WAV format 0x%04x at %d bits, not read by the WAV path\n", filepath, tag,
+				bits);
+		fclose(f);
+		return WAV_UNSUPPORTED;
+	}
+
+	info->src_frame_bytes = info->channels * (bits / 8);
+	info->out_bits = (info->sample == WAV_PCM_U8 || info->sample == WAV_PCM_S16) ? 16 : 32;
+
+	// Whole frames only.
+	info->data_size -= info->data_size % info->src_frame_bytes;
+
+	fseeko(f, (off_t)info->data_offset, SEEK_SET);
+	*file_out = f;
+	return WAV_OK;
+}
+
+// Turns `frames` frames read from the file into the samples the device takes.
+// Only called for the encodings that need it: S16 and S32 are read straight
+// into the output buffer.
+static void wav_convert(const wav_info_t *info, const unsigned char *in, void *out, size_t frames) {
+	size_t n = frames * (size_t)info->channels;
+	switch (info->sample) {
+	case WAV_PCM_U8: {
+		int16_t *o = out;
+		for (size_t i = 0; i < n; i++) {
+			o[i] = (int16_t)(((int)in[i] - 128) * 256);
+		}
+		break;
+	}
+	case WAV_PCM_S24: {
+		// Left-justified, as a 24-bit FLAC arrives: the low byte is zero.
+		int32_t *o = out;
+		for (size_t i = 0; i < n; i++, in += 3) {
+			uint32_t v = (uint32_t)in[0] << 8 | (uint32_t)in[1] << 16 | (uint32_t)in[2] << 24;
+			o[i] = (int32_t)v;
+		}
+		break;
+	}
+	case WAV_FLOAT32: {
+		int32_t *o = out;
+		for (size_t i = 0; i < n; i++) {
+			float x;
+			memcpy(&x, in + i * 4, sizeof(x));
+			o[i] = x >= 1.0f ? INT32_MAX : x < -1.0f ? INT32_MIN : x == x ? (int32_t)(x * 2147483648.0f) : 0;
+		}
+		break;
+	}
+	case WAV_FLOAT64: {
+		int32_t *o = out;
+		for (size_t i = 0; i < n; i++) {
+			double x;
+			memcpy(&x, in + i * 8, sizeof(x));
+			o[i] = x >= 1.0 ? INT32_MAX : x < -1.0 ? INT32_MIN : x == x ? (int32_t)(x * 2147483648.0) : 0;
+		}
+		break;
+	}
+	case WAV_PCM_S16:
+	case WAV_PCM_S32:
+		break;
+	}
+}
+
+static bool wav_needs_conversion(const wav_info_t *info) {
+	return info->sample != WAV_PCM_S16 && info->sample != WAV_PCM_S32;
+}
+
+// When non-zero, the next open_pcm_device() sizes the buffer to this many
+// milliseconds instead of its own 750.
+//
+// It exists for the emulator, whose need is the reverse of the one the 750 ms
+// serve: a game has to sound a button press now, not three quarters of a second
+// later, and the short buffer doubles as its metronome -- writing 738 samples
+// per frame to a blocking PCM lets ALSA keep the 59.73 fps pace instead of an
+// estimating usleep. The short reserve is affordable because the emulator does
+// not read the card while running: the ROM is already entirely in memory.
+static int pcm_forced_buffer_ms;
+
+// Set while a DoP stream is opened: a USB DAC is then held to its own rates.
+// Through plughw a rate the DAC lacks is converted by the plug, which for DoP
+// is not a quality question -- interpolated DoP words are no longer DSD, and
+// the DAC plays them as noise at full level. With this the open fails
+// instead, and the track is converted to PCM (see play_decoded_file). Read
+// by open_pcm_device_now() on the playback thread; an external source never
+// opens while a track is playing.
+static bool pcm_exact_rate;
+
+// ---------------------------------------------------------------------------
+// Gapless: the PCM that stays open between tracks
+//
+// Without it, the end of a track drains the PCM (snd_pcm_drain waits for the
+// card to play everything out), closes it and parks the thread; the interface
+// notices on the next tick of its timer, opens the next file, reopens the PCM
+// and starts writing again. Drain, close, a timer tick and two opens sit
+// between the last sample of one track and the first of the next -- a few
+// tenths of a second on this device, which is a defect on a live album or a
+// concept record where one track runs into the next.
+//
+// With it, the PCM is neither drained nor closed at the end of a track: it
+// stays open with its queue still inside -- up to 750 ms of music already
+// handed to the card, which keeps playing on its own. The next track opens
+// while that queue drains and appends to the same queue, so the card is never
+// left with nothing to play and there is no silence.
+//
+// The conditions for holding it are deliberately strict:
+//
+//   * the track must have ended on its own. After next, stop, or another
+//     track, the previous queue is not wanted: snd_pcm_drop as usual.
+//   * no DoP. A DSD stream has the DAC in a mode of its own, and appending PCM
+//     to it is full-volume noise.
+//   * the next track must have exactly the same format: channels, rate and
+//     depth. An open PCM is configured on those three numbers and cannot be
+//     reconfigured without closing it, which is the very thing being avoided.
+//     A 44.1 kHz album plays gapless; the 96 kHz track after it reopens and
+//     the gap returns, as it should.
+//   * and the same output. Switching to Bluetooth midway is a different PCM.
+//
+// If the next track never comes, the thread waits a little over half a second
+// (GAPLESS_HOLD_MS, less than the queue the card holds), then drains and
+// closes as it would have done immediately. End of album therefore costs half
+// a second of PCM held open, inaudibly.
+// ---------------------------------------------------------------------------
+
+// How long a PCM is held open while no next track arrives. 600 ms: less than
+// the ~750 the card has queued -- otherwise it would run dry first -- and more
+// than one tick of the timer that advances the queue.
+#define GAPLESS_HOLD_MS 600
+
+// How long a file that is still downloading is waited on before it is declared
+// unreadable. Six seconds in half-second steps: long enough for a slow network
+// to deliver the header, short enough not to look like a freeze -- and the
+// wait gives up on the first command anyway. See play_decoded_file().
+#define DECODER_GROW_RETRIES 12
+#define DECODER_GROW_RETRY_MS 500
+
+static bool gapless_enabled;
+
+// The pointer sits under a small lock of its own, held only briefly: another
+// thread can come to close it (the emulator claiming the PCM for itself, see
+// audio_external_begin_latency), and closing the same handle twice is a crash.
+// The actual drain happens outside the lock -- snd_pcm_drain waits for the
+// card to finish, and nobody should queue up behind that.
+static pthread_mutex_t held_lock = PTHREAD_MUTEX_INITIALIZER;
+static snd_pcm_t *held_pcm;
+static int held_channels;
+static int held_rate;
+static int held_bits;
+static snd_pcm_uframes_t held_period;
+static char held_device[sizeof(output_pcm)];
+
+// A Bluetooth stream converted to the headphones' rate is a plug of this
+// player's own, opened under this name; see open_bluetooth_at_rate(). It starts
+// with "bluealsa" so that pcm_is_bluetooth() knows the handle for what it is.
+#define BT_CONVERTED_PCM "bluealsa_sonix"
+
+// The route such a handle stands for, since its own name is the plug's.
+static snd_pcm_t *bt_converted_pcm;
+static char bt_converted_device[sizeof(output_pcm)];
+
+// The device name a handle was opened for: the route, for the converted plug.
+static const char *pcm_device_name(snd_pcm_t *pcm) {
+	const char *name = pcm ? snd_pcm_name(pcm) : NULL;
+	// A closed converted handle's address can be reused by a hardware PCM.
+	if (pcm && pcm == bt_converted_pcm && name && strcmp(name, BT_CONVERTED_PCM) == 0) {
+		return bt_converted_device;
+	}
+	return name;
+}
+static int held_route;
+// When the PCM was taken into hold, so the log says how long the next track
+// took to arrive: the margin gapless works within is the queue held at the end.
+static long held_since_ms;
+
+void audio_set_gapless(bool enabled) {
+	gapless_enabled = enabled;
+	printf("audio: gapless %s\n", enabled ? "on" : "off");
+}
+
+bool audio_get_gapless(void) { return gapless_enabled; }
+
+static bool pure_now(void) { return bit_perfect && !output_is_bluetooth(); }
+
+void audio_set_bit_perfect(bool on) {
+	bit_perfect = on;
+	fprintf(stderr, "audio: bit-perfect %s\n", on ? "on" : "off");
+}
+
+bool audio_get_bit_perfect(void) { return bit_perfect; }
+
+// How long a stream is given to play out what it still holds before it is
+// dropped instead. Comfortably more than the deepest buffer this player opens,
+// and short enough that a link which is never going to drain does not take the
+// playback thread with it.
+#define DRAIN_TIMEOUT_MS 3000
+
+// ...and how long it may make no progress at all before it is taken for
+// finished. The buffer going down slowly is a stream still playing out; the
+// buffer not going down is one nobody is reading.
+#define DRAIN_STALL_MS 200
+
+// How long a period should last above 192 kHz, and how large one is ever
+// allowed to get. The length is what 4096 frames last at 44.1 kHz, which is the
+// sizing every rate below has been using all along; the cap is there because
+// the frames are what the driver has to find DMA memory for, and a request it
+// cannot meet is settled downwards rather than refused.
+#define PERIOD_TARGET_MS 90
+#define PERIOD_FRAMES_MAX 32768
+
+// The smallest period the two limits below will go down to: 23 ms at 44.1 kHz,
+// the size the stock player runs with.
+#define PERIOD_FRAMES_MIN 1024
+
+// The most a USB DAC's buffer is asked to take up to 192 kHz, and how many
+// times a buffer the driver found no memory for is halved before giving up.
+// See open_pcm_device_now().
+#define USB_BUFFER_MAX_BYTES (512u * 1024u)
+#define PCM_NOMEM_HALVINGS 3
+
+// How much audio one turn of the decode loop handles.
+//
+// Not the same question as how deep the card's buffer is, and it has to be
+// asked separately: the driver settles the period wherever its DMA memory runs
+// out, so a long one asked for at 705.6 kHz can still come back short. The loop
+// would then turn a hundred and seventy times a second whatever was requested,
+// and the thread doing the turning is real-time on the one core the interface
+// also wants. It is not the work that hurts there, it is being interrupted that
+// often to do it.
+//
+// So a turn reads and writes whole periods until it has about this much, and
+// blocks once instead of eight times. snd_pcm_writei takes any number of
+// frames; more than a period is queued and waited on, which is the same waiting
+// done in one piece.
+#define CHUNK_TARGET_MS 90
+
+static snd_pcm_uframes_t chunk_for(snd_pcm_uframes_t period, int sample_rate) {
+	snd_pcm_uframes_t want = (snd_pcm_uframes_t)(((long)sample_rate * CHUNK_TARGET_MS) / 1000);
+	snd_pcm_uframes_t chunk = period;
+	while (chunk < want && chunk + period > chunk) {
+		chunk += period;
+	}
+	return chunk;
+}
+
+// How long the end of a track waits after closing a bluealsa PCM, before the
+// next track opens one. See the call site.
+#define BT_REOPEN_SETTLE_MS 200
+
+// Whether this handle -- not the route installed right now -- writes to
+// bluealsa. Asked of the handle, because the two can differ: the headphones
+// dropping flips the route back to the jack while the track being finished is
+// still on the old PCM, and every question below is about that PCM.
+// snd_pcm_name() answers with the name the handle was opened under, so it is
+// also right when an open fell back to the jack on its own.
+static bool pcm_is_bluetooth(snd_pcm_t *pcm) {
+	const char *name = pcm ? snd_pcm_name(pcm) : NULL;
+	return name && strncmp(name, "bluealsa", 8) == 0;
+}
+
+// Plays out what the stream still holds, and comes back whatever happens.
+//
+// snd_pcm_drain() on a blocking handle waits for the buffer to empty, and over
+// Bluetooth that can be for ever. A bluealsa PCM is not a sound card: there is
+// no clock consuming the buffer, only the A2DP link, and headphones walking out
+// of range are enough for it to stop consuming anything. A playback thread that
+// goes into alsa-lib there never comes out: the track never ends, the next play
+// request is never picked up, and the handle is never closed, which keeps
+// bluealsa's client alive with its transport acquired so the headphones cannot
+// re-establish it either.
+//
+// So over Bluetooth the waiting is done here instead: ask how much is still
+// queued, sleep, ask again, and give up at the deadline. snd_pcm_delay() reads
+// the stream's pointer and cannot block. On a real card the ordinary drain is
+// used, bounded by a clock that always runs.
+static void pcm_drain_bounded(snd_pcm_t *pcm) {
+	if (!pcm) {
+		return;
+	}
+	if (!pcm_is_bluetooth(pcm)) {
+		snd_pcm_drain(pcm);
+		return;
+	}
+
+	long waited_ms = 0;
+	long stalled_ms = 0;
+	snd_pcm_sframes_t previous = -1;
+	for (;;) {
+		snd_pcm_sframes_t left = 0;
+		// A handle that cannot say (an xrun, a plugin that has given up) has
+		// nothing left worth waiting for.
+		if (snd_pcm_delay(pcm, &left) < 0 || left <= 0) {
+			break;
+		}
+
+		// Gone as soon as it stops going down, not at the far end of the
+		// deadline. At the natural end of a track over A2DP the queue empties
+		// to within a period and then simply stops, because nothing is asking
+		// bluealsa for more; sitting out the whole deadline for that would put
+		// three seconds of silence between one track and the next. A fifth of a
+		// second without progress is proof enough.
+		if (previous >= 0 && left >= previous) {
+			stalled_ms += 20;
+		} else {
+			stalled_ms = 0;
+		}
+		previous = left;
+
+		if (stalled_ms >= DRAIN_STALL_MS || waited_ms >= DRAIN_TIMEOUT_MS) {
+			fprintf(stderr, "audio[%ld]: the Bluetooth PCM will not drain (%ld frames left after %ld ms): letting it go\n",
+					log_ms(), (long)left, waited_ms);
+			break;
+		}
+		usleep(20 * 1000);
+		waited_ms += 20;
+	}
+	// Either it played out or it never will; in both cases the stream stops
+	// here rather than in a wait with no end.
+	snd_pcm_drop(pcm);
+}
+
+// Closes the held PCM, letting it play out what it still has queued. Playback
+// thread only: nothing else touches held_pcm.
+static void gapless_release(void) {
+	pthread_mutex_lock(&held_lock);
+	snd_pcm_t *pcm = held_pcm;
+	held_pcm = NULL;
+	pthread_mutex_unlock(&held_lock);
+
+	if (!pcm) {
+		return;
+	}
+	fprintf(stderr, "audio[%ld]: gapless: closing the held PCM after %ld ms\n", log_ms(), log_ms() - held_since_ms);
+	if (snd_pcm_state(pcm) == SND_PCM_STATE_PREPARED) {
+		snd_pcm_start(pcm);
+	}
+	// Drain rather than drop: what is in there is the real tail of the track
+	// that just ended, and it has to be heard. With a deadline, because a
+	// handle that will never drain must not take the thread with it.
+	pcm_drain_bounded(pcm);
+	snd_pcm_close(pcm);
+	pcm_device_open = false;
+}
+
+// True while a PCM is currently being held.
+static bool gapless_holding(void) {
+	pthread_mutex_lock(&held_lock);
+	bool held = held_pcm != NULL;
+	pthread_mutex_unlock(&held_lock);
+	return held;
+}
+
+// The track ended on its own and the format can be reused, so keep the PCM.
+static void gapless_hold(snd_pcm_t *pcm, int channels, int rate, int bits, snd_pcm_uframes_t period) {
+	pthread_mutex_lock(&held_lock);
+	held_pcm = pcm;
+	pthread_mutex_unlock(&held_lock);
+	held_channels = channels;
+	held_rate = rate;
+	held_bits = bits;
+	held_period = period;
+	held_route = alsa_output_key();
+	held_since_ms = log_ms();
+	// The device this handle is really on. Taken from the handle and not from
+	// the route, for the reason given at keep_open: the route can already have
+	// moved on, and then the next track would be handed a PCM to somewhere it
+	// did not ask for.
+	const char *opened_as = pcm_device_name(pcm);
+	snprintf(held_device, sizeof(held_device), "%s", opened_as ? opened_as : AUDIO_DEFAULT_PCM);
+	fprintf(stderr, "audio[%ld]: gapless: holding the PCM (%d ch, %d Hz, %d bit)\n", log_ms(), channels, rate, bits);
+}
+
+// Whether a bluealsa handle can be held for the next track, or taken back for
+// it.
+//
+// A bluealsa PCM is not a sound card: its A2DP transport is released once the
+// stream stops being fed, and writes after that are accepted by the plugin and
+// go nowhere. So the handle must still be RUNNING with at least
+// BT_HOLD_MIN_QUEUE_MS of audio queued: the transport has never gone idle, and
+// the next track's first write lands before the queue runs out. And it must
+// still be the output: headphones dropping mid-track flip the route back to
+// the jack at once (bluetooth.c, apply_output_routing), and a track ending a
+// moment later would otherwise hold a dead handle.
+#define BT_HOLD_MIN_QUEUE_MS 120
+
+static bool bt_hold_usable(snd_pcm_t *pcm) {
+	if (snd_pcm_state(pcm) != SND_PCM_STATE_RUNNING) {
+		return false;
+	}
+	char device[sizeof(output_pcm)];
+	audio_get_output_device(device, sizeof(device));
+	const char *opened_as = pcm_device_name(pcm);
+	if (!opened_as || strcmp(device, opened_as) != 0) {
+		return false;
+	}
+	unsigned int rate = 0;
+	snd_pcm_hw_params_t *hw;
+	snd_pcm_hw_params_alloca(&hw);
+	if (snd_pcm_hw_params_current(pcm, hw) < 0 || snd_pcm_hw_params_get_rate(hw, &rate, NULL) < 0 || rate == 0) {
+		return false;
+	}
+	snd_pcm_sframes_t queued = 0;
+	if (snd_pcm_delay(pcm, &queued) < 0) {
+		return false;
+	}
+	return queued >= (snd_pcm_sframes_t)(rate * BT_HOLD_MIN_QUEUE_MS / 1000);
+}
+
+// The held PCM, when it is the one needed. On a format mismatch it is closed
+// and NULL returned, so the caller opens a device as usual.
+static snd_pcm_t *gapless_take(int channels, int rate, int bits, snd_pcm_uframes_t *period_out) {
+	if (!gapless_holding()) {
+		return NULL;
+	}
+
+	char device[sizeof(output_pcm)];
+	audio_get_output_device(device, sizeof(device));
+
+	// The output route counts too: headphones can have been plugged in between
+	// the two tracks, and reprogramming the codec under a live stream is
+	// exactly what the stock binary never does.
+	if (channels != held_channels || rate != held_rate || bits != held_bits || strcmp(device, held_device) != 0 ||
+		alsa_output_key() != held_route) {
+		fprintf(stderr, "audio[%ld]: gapless: different format (%d/%d/%d against %d/%d/%d), reopening\n", log_ms(), channels,
+				rate, bits, held_channels, held_rate, held_bits);
+		gapless_release();
+		return NULL;
+	}
+
+	pthread_mutex_lock(&held_lock);
+	snd_pcm_t *pcm = held_pcm;
+	held_pcm = NULL;
+	pthread_mutex_unlock(&held_lock);
+	if (!pcm) {
+		return NULL;
+	}
+	if (pcm_is_bluetooth(pcm) && !bt_hold_usable(pcm)) {
+		fprintf(stderr, "audio[%ld]: gapless: the Bluetooth queue ran low or the stream stopped, reopening\n",
+				log_ms());
+		pthread_mutex_lock(&held_lock);
+		held_pcm = pcm;
+		pthread_mutex_unlock(&held_lock);
+		gapless_release();
+		return NULL;
+	}
+	if (period_out) {
+		*period_out = held_period;
+	}
+	fprintf(stderr, "audio[%ld]: gapless: reusing the open PCM, the next track came %ld ms after the end\n", log_ms(),
+			log_ms() - held_since_ms);
+	return pcm;
+}
+
+// The output as an external source holds it, and who to ask for it back. Both
+// are read in open_pcm_device() without external_lock: that pointer is what the
+// retry loop is about to find busy anyway, so a stale read costs at worst one
+// request that was not needed, or one that arrives a moment late.
+static snd_pcm_t *external_pcm;
+static bool (*external_release_cb)(void);
+// Set when anything else asks for the output while an external source holds
+// it, for a source with no callback to be told through (audio_external_wanted).
+static atomic_bool external_wanted;
+// The holder gives way to anyone who asks (audio_external_begin_yielding).
+static bool external_yielding;
+
+void audio_set_external_release_cb(bool (*cb)(void)) { external_release_cb = cb; }
+
+// Asks whoever holds the output for it back, if anyone does.
+//
+// The AirPlay receiver holds the PCM for as long as it is switched on -- it
+// cannot tell that the phone has finished, because shairport keeps its socket
+// open for its whole life. Without this, a local track or a streamed one would
+// meet a busy device, retry for two seconds and give up.
+//
+// The request does not block: the hand-back happens on the AirPlay thread
+// within its poll, and the retry loop in open_pcm_device() is already built to
+// wait out a device that is busy for a moment.
+//
+// Never fires on the external path itself: audio_external_begin_latency() only
+// reaches open_pcm_device() with external_pcm still NULL.
+static void release_external_output(void) {
+	if (external_pcm) {
+		external_wanted = true;
+	}
+	if (external_pcm && external_release_cb) {
+		external_release_cb();
+	}
+}
+
+bool audio_external_wanted(void) { return external_wanted; }
+
+static void bt_seek_probe_cancel(void);
+
+// Which bluealsa plugin the ALSA loader actually mapped, said once.
+//
+// The plugin is a file in the firmware, not part of this build, and the two
+// that can be at that path are not interchangeable: the stock 4.1.1 drains with
+// poll(..., -1) and never reports SND_PCM_STATE_DRAINING, the 4.3.1 does both.
+// The path alone does not say which is there, so the size goes with it -- it is
+// what tells a replaced file from the original without opening a shell.
+static void log_bluealsa_plugin(void) {
+	static bool said;
+	if (said) {
+		return;
+	}
+	said = true;
+
+	FILE *maps = fopen("/proc/self/maps", "r");
+	if (!maps) {
+		return;
+	}
+	char line[512];
+	while (fgets(line, sizeof(line), maps)) {
+		char *at = strstr(line, "/libasound_module_pcm_bluealsa.so");
+		if (!at) {
+			continue;
+		}
+		char *start = strrchr(line, ' ');
+		if (!start) {
+			break;
+		}
+		start++;
+		start[strcspn(start, "\r\n")] = '\0';
+		struct stat st;
+		if (stat(start, &st) == 0) {
+			fprintf(stderr, "audio: bluealsa plugin %s (%ld bytes)\n", start, (long)st.st_size);
+		} else {
+			fprintf(stderr, "audio: bluealsa plugin %s\n", start);
+		}
+		break;
+	}
+	fclose(maps);
+}
+
+// The plugin chain behind an opened PCM (plug, conversions, dmix, rate, the
+// hardware) as snd_pcm_dump() describes it, logged whenever it differs from the
+// last one logged.
+static void log_pcm_chain(snd_pcm_t *pcm) {
+	static char last[4096];
+	snd_output_t *out = NULL;
+	if (snd_output_buffer_open(&out) < 0) {
+		return;
+	}
+	char *text = NULL;
+	if (snd_pcm_dump(pcm, out) >= 0 && snd_output_buffer_string(out, &text) > 0 && text &&
+		strncmp(text, last, sizeof(last) - 1) != 0) {
+		snprintf(last, sizeof(last), "%s", text);
+		char *save = NULL;
+		for (char *line = strtok_r(text, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {
+			fprintf(stderr, "audio: pcm | %s\n", line);
+		}
+	}
+	snd_output_close(out);
+}
+
+// ---------------------------------------------------------------------------
+// Bluetooth at the headphones' own rate
+//
+// bluealsa's plugin answers a rate other than the one the A2DP stream runs at by
+// asking the headphones for a new configuration, in the middle of the
+// connection: the transport is torn down and built again. Some headphones
+// refuse ("Couldn't set A2DP configuration: Resource temporarily unavailable"),
+// the track does not start, and with a pair of ROSE Ceramics U bluetoothd went
+// down after the refusal and took the connection with it. Where it works it is
+// still a gap, and the remote's buttons dropping, at every change of rate.
+//
+// So the stream stays at the rate chosen when the link came up, and the track is
+// converted to it by a plug of this player's own in front of bluealsa's PCM, its
+// slave rate fixed. [bluetooth] follow_track_rate = 1 asks the headphones
+// instead, as before.
+// ---------------------------------------------------------------------------
+
+// Opens `device` (a bluealsa name) behind a plug whose slave runs at `rate`,
+// under BT_CONVERTED_PCM. The plug is added to a copy of the global
+// configuration, where bluealsa's own definitions are, and the copy is dropped
+// once the PCM is open -- which is what snd_pcm_open() does with the
+// configuration it opens from, too.
+static int open_bluetooth_at_rate(snd_pcm_t **pcm, const char *device, unsigned rate, int mode) {
+	char text[sizeof(output_pcm) + 128];
+	int len = snprintf(text, sizeof(text), "pcm." BT_CONVERTED_PCM " { type plug slave { pcm \"%s\" rate %u } }",
+					   device, rate);
+	if (len < 0 || (size_t)len >= sizeof(text)) {
+		return -EINVAL;
+	}
+
+	int err = snd_config_update();
+	if (err < 0) {
+		return err;
+	}
+	snd_config_t *conf = NULL;
+	err = snd_config_copy(&conf, snd_config);
+	if (err < 0) {
+		return err;
+	}
+	snd_input_t *in = NULL;
+	err = snd_input_buffer_open(&in, text, len);
+	if (err >= 0) {
+		err = snd_config_load(conf, in);
+		snd_input_close(in);
+	}
+	if (err >= 0) {
+		err = snd_pcm_open_lconf(pcm, BT_CONVERTED_PCM, SND_PCM_STREAM_PLAYBACK, mode, conf);
+	}
+	snd_config_delete(conf);
+	if (err >= 0) {
+		bt_converted_pcm = *pcm;
+		snprintf(bt_converted_device, sizeof(bt_converted_device), "%s", device);
+	}
+	return err;
+}
+
+#ifndef HOST_BUILD
+// How the kernel's free memory is split up, one line per zone: the number of
+// free blocks of 1, 2, 4, 8... pages. Written when a driver finds no memory,
+// because MemAvailable cannot say whether the memory is short or only broken
+// into pieces.
+static void log_buddyinfo(const char *when) {
+	FILE *f = fopen("/proc/buddyinfo", "r");
+	if (!f) {
+		return;
+	}
+	char line[200];
+	while (fgets(line, sizeof(line), f)) {
+		fprintf(stderr, "audio: free blocks %s | %s", when, line);
+	}
+	fclose(f);
+}
+#endif
+
+// Lets go of the kernel's page cache: the clean copies of files it keeps in
+// whatever memory is free. Nothing is lost -- the files are still on the card
+// and on flash -- and what comes back is free memory in larger pieces, which is
+// what a driver allocating its buffers needs and what hours of reading scatter.
+// Dirty pages are not touched, and nothing waits for the card.
+static void release_page_cache(void) {
+#ifndef HOST_BUILD
+	log_buddyinfo("before");
+	FILE *f = fopen("/proc/sys/vm/drop_caches", "w");
+	if (!f) {
+		return;
+	}
+	fputs("1\n", f);
+	fclose(f);
+	fprintf(stderr, "audio: page cache released for the driver's buffer\n");
+	log_buddyinfo("after");
+#endif
+}
+
+static uint64_t paused_clock_ms(void);
+
+typedef struct {
+	char device[sizeof(output_pcm)];
+	bool bluetooth;
+	int mode;
+	unsigned convert_to, generation;
+} pcm_open_route_t;
+
+// Retry boundaries only: no D-Bus call or lock is held across ALSA.
+static bool pcm_open_route_refresh(pcm_open_route_t *route, int sample_rate, bool follow_track_rate) {
+	pcm_open_route_t next = {0};
+	audio_get_output_device(next.device, sizeof(next.device));
+	next.bluetooth = strncmp(next.device, "bluealsa", 8) == 0;
+	if (next.bluetooth && !bluetooth_audio_active()) {
+		if (output_device_set_if(next.device, NULL)) {
+			fprintf(stderr, "audio: '%s' has no sink any more; the jack takes it back\n", next.device);
+		}
+		// A failed conditional reset means a newer selection must be respected.
+		audio_get_output_device(next.device, sizeof(next.device));
+		next.bluetooth = strncmp(next.device, "bluealsa", 8) == 0;
+	}
+	next.mode = next.bluetooth ? SND_PCM_NONBLOCK : 0;
+	if (next.bluetooth) {
+		next.generation = bluetooth_output_generation();
+		if (!follow_track_rate) {
+			unsigned rate = bluetooth_sink_rate();
+			if (rate > 0 && rate != (unsigned)sample_rate)
+				next.convert_to = rate;
+		}
+	}
+	bool changed = strcmp(route->device, next.device) != 0 || route->bluetooth != next.bluetooth ||
+				   route->mode != next.mode || route->convert_to != next.convert_to || route->generation != next.generation;
+	if (changed && next.convert_to)
+		fprintf(stderr, "audio: the headphones stay at %u Hz; the %d Hz track is converted to it\n", next.convert_to, sample_rate);
+	*route = next;
+	return changed;
+}
+
+// Busy transport/configuration is not a refusal of the sample format.
+static bool pcm_setup_fallback_allowed(const pcm_open_error_t *failure) {
+	return failure->code != -ENOMEM &&
+		(!failure->bt_ordinary_endpoint || (failure->code != -EBUSY && failure->code != -EAGAIN));
+}
+
+static snd_pcm_t *open_pcm_device_now(int channels, int sample_rate, int bits_per_sample, snd_pcm_uframes_t *period_size_out, pcm_open_error_t *failure) {
+	failure->code = 0;
+	failure->bt_ordinary_endpoint = false;
+	snd_pcm_t *pcm_handle = NULL;
+	alsa_wait_output_reinit();
+	release_external_output();
+
+	pcm_open_route_t route = {0};
+	audio_get_output_device(route.device, sizeof(route.device));
+	route.bluetooth = strncmp(route.device, "bluealsa", 8) == 0;
+	// A caller may already hold DoP frames even if the selected name just became BT.
+	// Only an ordinary PCM open that began on BT gains the new retarget policy.
+	bool retarget = route.bluetooth && !pcm_exact_rate;
+	failure->bt_ordinary_endpoint = retarget;
+	bool follow_track_rate = route.bluetooth && config_get_int("bluetooth", "follow_track_rate", 0);
+	if (retarget) {
+		pcm_open_route_refresh(&route, sample_rate, follow_track_rate);
+	} else {
+		// Preserve the existing non-BT/DoP open and fallback policy.
+		if (route.bluetooth && !bluetooth_audio_active()) {
+			fprintf(stderr, "audio: '%s' has no sink any more; the jack takes it back\n", route.device);
+			audio_set_output_device(NULL);
+			snprintf(route.device, sizeof(route.device), "%s", AUDIO_DEFAULT_PCM);
+			route.bluetooth = false;
+		}
+		route.mode = route.bluetooth ? SND_PCM_NONBLOCK : 0;
+		if (route.bluetooth && !follow_track_rate) {
+			unsigned rate = bluetooth_sink_rate();
+			if (rate > 0 && rate != (unsigned)sample_rate) {
+				route.convert_to = rate;
+				fprintf(stderr, "audio: the headphones stay at %u Hz; the %d Hz track is converted to it\n", rate, sample_rate);
+			}
+		}
+	}
+
+	// One total budget; neither endpoint churn nor daemon replacement restarts it.
+	int budget = (route.bluetooth && bluetooth_audio_active()) ? 160 : 40;
+	int err = -EBUSY, attempts = 0;
+	bool fallback_attempted = false, route_changed = false, used_default = false;
+	char opened_device[sizeof(output_pcm)];
+	snprintf(opened_device, sizeof(opened_device), "%s", route.device);
+	// One set of stack parameter buffers, also across a late route retry.
+	snd_pcm_hw_params_t *hw_params, *unsized;
+	snd_pcm_hw_params_alloca(&hw_params);
+	snd_pcm_hw_params_alloca(&unsized);
+	snd_pcm_sw_params_t *sw_params;
+	snd_pcm_sw_params_alloca(&sw_params);
+	uint64_t began = paused_clock_ms();
+	// The existing attempt cap remains; configuration retries also share a
+	// monotonic deadline. A blocking ALSA call itself cannot be preempted here.
+	uint64_t deadline = began + (uint64_t)budget * 50u;
+retry_open:
+	for (; attempts < budget && (!retarget || paused_clock_ms() < deadline);) {
+		if (retarget)
+			pcm_open_route_refresh(&route, sample_rate, follow_track_rate);
+		used_default = false;
+		bool attempted_bt = route.bluetooth;
+		failure->bt_ordinary_endpoint = retarget && attempted_bt;
+		snprintf(opened_device, sizeof(opened_device), "%s", route.device);
+		attempts++;
+		err = route.convert_to ? open_bluetooth_at_rate(&pcm_handle, route.device, route.convert_to, route.mode)
+						   : snd_pcm_open(&pcm_handle, route.device, SND_PCM_STREAM_PLAYBACK, route.mode);
+		route_changed = retarget && pcm_open_route_refresh(&route, sample_rate, follow_track_rate);
+		if (err >= 0 && !route_changed)
+			break;
+		if (err >= 0) {
+			// A successful obsolete handle is still owned by this attempt alone.
+			snd_pcm_close(pcm_handle);
+			pcm_handle = NULL;
+			err = -EAGAIN;
+			usleep(150 * 1000);
+			continue;
+		}
+		bool transient = err == -EBUSY || err == -EAGAIN ||
+			(attempted_bt && (err == -ENODEV || err == -EIO || err == -ETIMEDOUT || err == -ECONNREFUSED));
+		if (!route_changed && !transient)
+			break;
+		usleep(50 * 1000);
+	}
+
+	if (err < 0 && retarget && pcm_open_route_refresh(&route, sample_rate, follow_track_rate)) {
+		route_changed = true;
+		if (attempts < budget && paused_clock_ms() < deadline)
+			goto retry_open;
+	}
+	// At most the existing one default fallback. Do not use an obsolete failure
+	// to fall back over a newer desired route after the shared budget ran out.
+	if (err < 0 && !route_changed && !fallback_attempted && strcmp(route.device, AUDIO_DEFAULT_PCM) != 0) {
+		char failed_device[sizeof(output_pcm)];
+		snprintf(failed_device, sizeof(failed_device), "%s", route.device);
+		bool failed_bt = route.bluetooth;
+		fprintf(stderr, "audio: '%s' would not open (%s); falling back to " AUDIO_DEFAULT_PCM "\n", failed_device, snd_strerror(err));
+		fallback_attempted = true;
+		snprintf(opened_device, sizeof(opened_device), "%s", AUDIO_DEFAULT_PCM);
+		failure->bt_ordinary_endpoint = false;
+		attempts++;
+		err = snd_pcm_open(&pcm_handle, AUDIO_DEFAULT_PCM, SND_PCM_STREAM_PLAYBACK, 0);
+		if (retarget && pcm_open_route_refresh(&route, sample_rate, follow_track_rate) && strcmp(route.device, AUDIO_DEFAULT_PCM) != 0) {
+			route_changed = true;
+			if (err >= 0) {
+				snd_pcm_close(pcm_handle);
+				pcm_handle = NULL;
+				usleep(150 * 1000);
+			}
+			err = -EAGAIN;
+			if (attempts < budget && paused_clock_ms() < deadline)
+				goto retry_open;
+		} else if (err >= 0) {
+			if (failed_bt && !bluetooth_audio_active()) {
+				if (retarget)
+					output_device_set_if(failed_device, NULL);
+				else
+					audio_set_output_device(NULL);
+			}
+			used_default = retarget;
+		}
+	}
+	if (err < 0) {
+		fprintf(stderr, "Audio: Cannot open PCM device '%s': %s (after %d attempts)\n", opened_device, snd_strerror(err), attempts);
+		failure->code = err;
+		return NULL;
+	}
+	if (attempts > 1)
+		fprintf(stderr, "audio[%ld]: opening '%s' used %d attempts in %llu ms\n", log_ms(), opened_device, attempts,
+				(unsigned long long)(paused_clock_ms() - began));
+	const char *device = used_default ? AUDIO_DEFAULT_PCM : route.device;
+	bool bluetooth = route.bluetooth && !used_default;
+	failure->bt_ordinary_endpoint = retarget && bluetooth;
+
+	snd_pcm_hw_params_any(pcm_handle, hw_params);
+	snd_pcm_hw_params_set_access(pcm_handle, hw_params, SND_PCM_ACCESS_RW_INTERLEAVED);
+
+	snd_pcm_format_t format;
+	if (bits_per_sample == 8) {
+		format = SND_PCM_FORMAT_U8;
+	} else if (bits_per_sample == 16) {
+		format = SND_PCM_FORMAT_S16_LE;
+	} else if (bits_per_sample == 24) {
+		format = SND_PCM_FORMAT_S24_3LE;
+	} else if (bits_per_sample == 32) {
+		// The built-in card in its own format, so that nothing converts on
+		// the way; see pcm_takes_s24().
+		format = pcm_takes_s24(pcm_handle, 32) ? SND_PCM_FORMAT_S24_LE : SND_PCM_FORMAT_S32_LE;
+	} else {
+		fprintf(stderr, "Audio: Unsupported bits per sample: %d\n", bits_per_sample);
+		snd_pcm_close(pcm_handle);
+		return NULL;
+	}
+
+	err = snd_pcm_hw_params_set_format(pcm_handle, hw_params, format);
+	if (err < 0) {
+		failure->code = err;
+		fprintf(stderr, "audio: format %s refused by the device\n", snd_pcm_format_name(format));
+		snd_pcm_close(pcm_handle);
+		return NULL;
+	}
+	// Checked, because a refusal here is silent and sounds like something else
+	// entirely. If the device will not do this channel count the parameters
+	// keep whatever the hardware allows, and frames written in the layout the
+	// caller believes in then come out at the wrong speed with the channels
+	// interleaved wrongly -- which is heard as a completely different piece of
+	// audio, not as an error.
+	if (snd_pcm_hw_params_set_channels(pcm_handle, hw_params, channels) < 0) {
+		unsigned int got = (unsigned int)channels;
+		snd_pcm_hw_params_set_channels_near(pcm_handle, hw_params, &got);
+		fprintf(stderr, "audio: %d channel(s) refused, device settled on %u\n", channels, got);
+	}
+
+	// The rate is set exactly, not "near": this DAC follows the track (the CS43198
+	// is fed whatever the stream runs at), and silently resampling a 96 kHz file
+	// down to 44.1 is precisely what "the DAC does not really change rate" would
+	// look like. If the hardware truly cannot do this rate, fall back to the
+	// nearest one rather than failing the track -- and say so in the log.
+	unsigned int val = sample_rate;
+	int dir = 0;
+	bool exact_rate = pcm_exact_rate && (strncmp(device, "plughw:", 7) == 0 || strncmp(device, "hw:", 3) == 0);
+	if (exact_rate) {
+		snd_pcm_hw_params_set_rate_resample(pcm_handle, hw_params, 0);
+	}
+	if (exact_rate && snd_pcm_hw_params_set_rate(pcm_handle, hw_params, val, 0) < 0) {
+		fprintf(stderr, "audio: '%s' has no %d Hz of its own, and DoP cannot be converted\n", device, sample_rate);
+		failure->code = -EINVAL;
+		snd_pcm_close(pcm_handle);
+		return NULL;
+	}
+	if (snd_pcm_hw_params_set_rate(pcm_handle, hw_params, val, 0) < 0) {
+		snd_pcm_hw_params_set_rate_near(pcm_handle, hw_params, &val, &dir);
+		fprintf(stderr, "audio: %d Hz unavailable, device settled on %u Hz\n", sample_rate, val);
+	}
+
+	// A deep buffer, on purpose: ~0.75 s at 44.1 kHz. The playback thread can
+	// stall for seconds when a big album cover decodes at a track change
+	// (memory pressure evicts code pages, the SD is saturated, the thread
+	// page-faults), and the AIC driver answers a starved stream with EIO. Four
+	// periods of 1024 frames (93 ms) cannot ride that out; this absorbs most of
+	// it. Responsiveness does not suffer: stops and switches drop the buffer,
+	// they never drain it.
+	unsigned int periods = 8;
+	snd_pcm_uframes_t period_size = 4096;
+
+	// ...as long as 4096 frames are still a period. Past 96 kHz they stop being
+	// one and become a fragment, and the reserve goes with them: 4096 frames are
+	// 93 ms at 44.1 kHz, 23 ms at 176.4 kHz, and 5.8 ms at 705.6 kHz, where
+	// DSD256 goes over DoP. The whole eight-period buffer at 705.6 kHz was
+	// 46 ms, and the stream starts on a full buffer, so that was also all it
+	// ever had in hand against an interface sharing the one core. The first
+	// thing that takes the core for longer than that is an underrun, a prepare
+	// and a rewrite.
+	//
+	// So above 96 kHz the period is chosen by how long it lasts instead, and the
+	// reserve comes out where it is at 44.1 kHz. Everything at or below keeps
+	// exactly the sizing it has always had.
+	if (sample_rate > 96000) {
+		// Doubled while the next step is still near the target rather than past
+		// it: a period is a power of two here, and always taking the first one
+		// longer than the target would ask for 170 ms at 192 kHz to hit 90.
+		snd_pcm_uframes_t want = (snd_pcm_uframes_t)(((long)sample_rate * PERIOD_TARGET_MS) / 1000);
+		while (period_size * 2 <= want + want / 2 && period_size * 2 <= PERIOD_FRAMES_MAX) {
+			period_size *= 2;
+		}
+	}
+
+	// A USB DAC is the exception, up to 192 kHz. Its buffer is not memory the
+	// card was given at boot, as the built-in DAC's is: snd-usb-audio allocates
+	// it at every open, together with the transfer buffers, and frees it at every
+	// close -- so on this device, with 56 MB for everything, a track change is a
+	// fresh request for all of it. The period sizing above asks 1 MB of it for a
+	// 24-bit track at 176.4 or 192 kHz. Capped, those keep a period of 8192
+	// frames and a buffer of about 350 ms, which is still several times what one
+	// stall of the interface takes. Above 192 kHz (DoP, DXD) the reserve is
+	// already as thin as it can be and the sizing stays; a refusal there is left
+	// to the retry below.
+	//
+	// A card named by number is a USB one: the built-in DAC is "default" and
+	// Bluetooth is "bluealsa...".
+	bool usb_card = strncmp(device, "plughw:", 7) == 0 || strncmp(device, "hw:", 3) == 0;
+	unsigned int frame_bytes = (unsigned int)channels * (unsigned int)((bits_per_sample + 7) / 8);
+	if (usb_card && sample_rate <= 192000 && frame_bytes > 0) {
+		while (period_size > PERIOD_FRAMES_MIN && period_size * periods * frame_bytes > USB_BUFFER_MAX_BYTES) {
+			period_size /= 2;
+		}
+	}
+
+	// The space as it stands before the buffer is sized, for the retry below:
+	// once a size has been asked for, the parameters hold that one value and
+	// nothing else.
+	snd_pcm_hw_params_copy(unsized, hw_params);
+
+	// Two ways of asking for a buffer, selected by a config key. The default is
+	// the frame-based sizing above.
+	//
+	// The stock player's way, when "audio"/"buffer_time_ms" is set: the size is
+	// asked for in TIME and ALSA picks the frames. A value of 200 is roughly
+	// what a normal player uses.
+	//   [audio]
+	//   buffer_time_ms = 200
+	// The emulator asks for a much shorter buffer of its own and overrides both:
+	// see pcm_forced_buffer_ms.
+	int buffer_time_ms = pcm_forced_buffer_ms > 0 ? pcm_forced_buffer_ms : (int)config_get_int("audio", "buffer_time_ms", 0);
+	if (buffer_time_ms > 0) {
+		unsigned int buffer_time = (unsigned int)buffer_time_ms * 1000u;   // microseconds
+		unsigned int period_time = buffer_time / 4;
+		snd_pcm_hw_params_set_buffer_time_near(pcm_handle, hw_params, &buffer_time, &dir);
+		snd_pcm_hw_params_set_period_time_near(pcm_handle, hw_params, &period_time, &dir);
+		fprintf(stderr, "audio: stock-style sizing, buffer %u us / period %u us\n", buffer_time,
+				period_time);
+	} else {
+		snd_pcm_hw_params_set_periods_near(pcm_handle, hw_params, &periods, &dir);
+		snd_pcm_hw_params_set_period_size_near(pcm_handle, hw_params, &period_size, &dir);
+	}
+
+	err = snd_pcm_hw_params(pcm_handle, hw_params);
+
+	// Out of memory is not a refusal of the format. The driver is asking the
+	// kernel for the buffer this very moment, and after hours of reading the
+	// card the free memory is in pieces too small for it even with megabytes
+	// "available". Asking again at once for the same amount, or for another
+	// large amount in another format, is the likeliest way to take the device
+	// down with it. So the page cache is let go once -- clean copies of files,
+	// which the card still holds -- and the same format is asked for again with
+	// half the buffer each time, down to a floor.
+	for (int halvings = 0; err == -ENOMEM && buffer_time_ms <= 0 && halvings < PCM_NOMEM_HALVINGS &&
+						   period_size / 2 >= PERIOD_FRAMES_MIN;
+		 halvings++) {
+		if (halvings == 0) {
+			release_page_cache();
+		}
+		period_size /= 2;
+		fprintf(stderr, "audio: no memory in the driver for the buffer; asking again with %lu-frame periods\n",
+				(unsigned long)period_size);
+		snd_pcm_hw_params_copy(hw_params, unsized);
+		periods = 8;
+		snd_pcm_hw_params_set_periods_near(pcm_handle, hw_params, &periods, &dir);
+		snd_pcm_hw_params_set_period_size_near(pcm_handle, hw_params, &period_size, &dir);
+		err = snd_pcm_hw_params(pcm_handle, hw_params);
+	}
+	if (err < 0) {
+		failure->code = err;
+		snd_pcm_close(pcm_handle);
+		pcm_handle = NULL;
+		// BlueALSA can open its client before the previous transport has
+		// finished releasing. Reopening only the client is not enough: retry
+		// its complete configuration with the same depth/rate/channels.
+		if (retarget && bluetooth && (err == -EBUSY || err == -EAGAIN)) {
+			uint64_t now = paused_clock_ms();
+			if (attempts < budget && now < deadline) {
+				unsigned wait_ms = deadline - now < 150u ? (unsigned)(deadline - now) : 150u;
+				fprintf(stderr, "audio: Bluetooth HW setup busy; retrying the same format after close\n");
+				usleep(wait_ms * 1000u);
+				if (paused_clock_ms() < deadline) {
+					pcm_open_route_refresh(&route, sample_rate, follow_track_rate);
+					goto retry_open;
+				}
+			}
+		}
+		fprintf(stderr, "Audio: Cannot apply HW parameters: %s\n", snd_strerror(err));
+		return NULL;
+	}
+
+	audio_output_format_t negotiated = {0};
+	// Read back what the hardware actually settled on, not what was asked for:
+	// this line is the answer to "is the DAC really following the track?" --
+	// play a 24/96 FLAC after a 16/44.1 MP3 and the log has to change.
+	{
+		unsigned int actual_rate = 0;
+		snd_pcm_format_t actual_format = SND_PCM_FORMAT_UNKNOWN;
+		unsigned int actual_channels = 0;
+		int rdir = 0;
+		snd_pcm_hw_params_get_rate(hw_params, &actual_rate, &rdir);
+		snd_pcm_hw_params_get_format(hw_params, &actual_format);
+		snd_pcm_hw_params_get_channels(hw_params, &actual_channels);
+		int actual_bits = snd_pcm_hw_params_get_sbits(hw_params);
+		if (actual_bits <= 0)
+			actual_bits = snd_pcm_format_width(actual_format);
+		negotiated.rate = actual_rate;
+		negotiated.channels = actual_channels;
+		negotiated.bits = actual_bits > 0 ? (unsigned)actual_bits : 0;
+		negotiated.dop = pcm_exact_rate;
+		// The device name belongs on this line: without it the log cannot tell
+		// a track that went to the headphones from one that went to the jack,
+		// since the two otherwise print identically.
+		fprintf(stderr, "audio[%ld]: PCM open on '%s': %u Hz %s %u ch (asked for %d Hz / %d bit)\n", log_ms(), opened_device,
+				actual_rate, snd_pcm_format_name(actual_format), actual_channels, sample_rate, bits_per_sample);
+	}
+
+	// A seek measurement belongs to the stream it was taken on. A track change
+	// between the seek and the measurement gives a fresh, still-filling PCM and
+	// a number that says nothing about the seek.
+	bt_seek_probe_cancel();
+
+	if (bluetooth) {
+		log_bluealsa_plugin();
+	}
+
+	// What ALSA settled on, whichever way it was asked: with time-based sizing
+	// the frames were its choice from the start, and with frame-based sizing a
+	// long period can be more than the driver will allocate, so "near" is not
+	// "what was asked for". The write loop is driven by this number and the
+	// buffer it writes from is allocated to it.
+	{
+		snd_pcm_uframes_t actual_period = 0;
+		if (snd_pcm_hw_params_get_period_size(hw_params, &actual_period, &dir) >= 0 && actual_period > 0) {
+			period_size = actual_period;
+		}
+		snd_pcm_uframes_t actual_buffer = 0;
+		if (snd_pcm_hw_params_get_buffer_size(hw_params, &actual_buffer) >= 0 && actual_buffer > 0) {
+			unsigned int rate = val ? val : (unsigned int)sample_rate;
+			fprintf(stderr, "audio: buffer %lu frames (%u ms), period %lu frames (%u ms)\n",
+					(unsigned long)actual_buffer, (unsigned int)((actual_buffer * 1000u) / rate),
+					(unsigned long)period_size, (unsigned int)((period_size * 1000u) / rate));
+		}
+	}
+
+	// The software parameters are always set, and the important one is the
+	// start threshold: the stream only starts on a full buffer.
+	//
+	// Otherwise the stream starts on the first period written -- 25 ms of
+	// reserve at 176.4 kHz -- and any system hiccup (the SD card contended with
+	// a download, a cover being decoded) turns straight into an underrun. After
+	// a seek or an unpause that becomes a "Broken pipe" on every write: the
+	// stream restarts with a single period queued and dies before the next one.
+	// Starting on a full buffer gives every start and restart the whole buffer
+	// as reserve.
+	{
+		snd_pcm_uframes_t buffer_frames = 0;
+		snd_pcm_hw_params_get_buffer_size(hw_params, &buffer_frames);
+
+		if (snd_pcm_sw_params_current(pcm_handle, sw_params) >= 0) {
+			snd_pcm_sw_params_set_avail_min(pcm_handle, sw_params, period_size);
+			// Start threshold = the whole buffer (see above).
+			if (buffer_frames > 0) {
+				snd_pcm_sw_params_set_start_threshold(pcm_handle, sw_params, buffer_frames);
+			}
+			snd_pcm_sw_params(pcm_handle, sw_params);
+		}
+	}
+
+	log_pcm_chain(pcm_handle);
+
+	// Configuration can also outlive a route change. Do not publish that PCM.
+	if (retarget && pcm_open_route_refresh(&route, sample_rate, follow_track_rate) &&
+		(!used_default || strcmp(route.device, AUDIO_DEFAULT_PCM) != 0)) {
+		fprintf(stderr, "audio: output moved while configuring '%s'; reopening the current route\n", opened_device);
+		snd_pcm_close(pcm_handle);
+		pcm_handle = NULL;
+		usleep(150 * 1000);
+		err = -EAGAIN;
+		route_changed = true;
+		if (attempts < budget && paused_clock_ms() < deadline)
+			goto retry_open;
+		failure->code = err;
+		return NULL;
+	}
+	failure->code = 0;
+	*period_size_out = period_size;
+	pthread_mutex_lock(&output_lock);
+	output_format = negotiated;
+	snprintf(output_format_device, sizeof(output_format_device), "%s", route.device);
+	pthread_mutex_unlock(&output_lock);
+	pcm_device_open = true;
+	return pcm_handle;
+}
+
+// Every PCM this player opens goes through here, so that audio_quiet_ms() knows
+// when one is being opened and when the last one was.
+static snd_pcm_t *open_pcm_device(int channels, int sample_rate, int bits_per_sample, snd_pcm_uframes_t *period_size_out, pcm_open_error_t *failure) {
+	pcm_open_error_t local_failure;
+	if (!failure)
+		failure = &local_failure;
+	pcm_opening = true;
+	snd_pcm_t *pcm = open_pcm_device_now(channels, sample_rate, bits_per_sample, period_size_out, failure);
+	if (!pcm && failure->code == 0) {
+		failure->code = -EIO;
+	}
+	quiet_since_ms = log_ms();
+	pcm_opening = false;
+	return pcm;
+}
+
+// The end of a track start, as audio_quiet_ms() counts it: the PCM is open, or
+// the attempt is over.
+static void track_started(void) {
+	if (track_starting) {
+		quiet_since_ms = log_ms();
+		track_starting = false;
+	}
+}
+
+// A line every HEALTH_PERIOD_MS while a track plays: the share of the core the
+// playback thread used, how many writes needed recovering, and MemAvailable.
+// While a stream plays the thread runs SCHED_RR on a single core, so whatever
+// it uses is taken from the interface first.
+#define HEALTH_PERIOD_MS 10000
+
+static volatile unsigned write_recoveries; // counted in pcm_write_recover()
+
+// Where the thread's time goes inside a turn: reading and decoding the file,
+// the effects chain, and handing the block to ALSA (alsa-lib and the kernel).
+typedef enum { STAGE_READ, STAGE_EFFECTS, STAGE_WRITE, STAGE_COUNT } stage_t;
+
+typedef struct {
+	long at_ms;
+	int64_t cpu_ns;
+	unsigned recoveries;
+	int64_t stage_ns[STAGE_COUNT];
+	int64_t lap_ns;
+	// Clock ticks from /proc, -1 when unreadable: the whole system (total and
+	// idle), the interface thread, and bluealsa while the output is Bluetooth.
+	long long sys_total, sys_idle, ui_ticks, bluealsa_ticks;
+} health_t;
+
+static int64_t thread_cpu_ns(void) {
+	struct timespec ts;
+	if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts) != 0) {
+		return 0;
+	}
+	return (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+}
+
+static long mem_available_kb(void) {
+	FILE *f = fopen("/proc/meminfo", "r");
+	if (!f) {
+		return -1;
+	}
+	char line[96];
+	long kb = -1;
+	while (fgets(line, sizeof(line), f)) {
+		if (sscanf(line, "MemAvailable: %ld kB", &kb) == 1) {
+			break;
+		}
+	}
+	fclose(f);
+	return kb;
+}
+
+// "cpu" line of /proc/stat: all ticks, and idle plus iowait.
+static bool system_ticks(long long *total, long long *idle) {
+	FILE *f = fopen("/proc/stat", "r");
+	if (!f) {
+		return false;
+	}
+	unsigned long long v[8] = {0};
+	int n = fscanf(f, "cpu %llu %llu %llu %llu %llu %llu %llu %llu", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5], &v[6],
+				   &v[7]);
+	fclose(f);
+	if (n < 4) {
+		return false;
+	}
+	*total = 0;
+	for (int i = 0; i < 8; i++) {
+		*total += (long long)v[i];
+	}
+	*idle = (long long)(v[3] + v[4]);
+	return true;
+}
+
+// utime + stime of a /proc/.../stat file, -1 when unreadable. The fields
+// after the command name, which can hold spaces, are counted from the last ')'.
+static long long stat_ticks(const char *path) {
+	FILE *f = fopen(path, "r");
+	if (!f) {
+		return -1;
+	}
+	char line[512];
+	char *ok = fgets(line, sizeof(line), f);
+	fclose(f);
+	char *p = ok ? strrchr(line, ')') : NULL;
+	if (!p) {
+		return -1;
+	}
+	unsigned long long utime = 0, stime = 0;
+	// state ppid pgrp session tty tpgid flags minflt cminflt majflt cmajflt utime stime
+	if (sscanf(p + 1, " %*c %*d %*d %*d %*d %*d %*u %*u %*u %*u %*u %llu %llu", &utime, &stime) != 2) {
+		return -1;
+	}
+	return (long long)(utime + stime);
+}
+
+// bluealsa's pid, looked up in /proc and kept while its comm still matches.
+static int bluealsa_pid;
+
+static bool pid_is_bluealsa(int pid) {
+	char path[48], comm[32] = {0};
+	snprintf(path, sizeof(path), "/proc/%d/comm", pid);
+	FILE *f = fopen(path, "r");
+	if (!f) {
+		return false;
+	}
+	bool ok = fgets(comm, sizeof(comm), f) != NULL;
+	fclose(f);
+	return ok && strncmp(comm, "bluealsa\n", 9) == 0;
+}
+
+static long long bluealsa_ticks(void) {
+	if (bluealsa_pid <= 0 || !pid_is_bluealsa(bluealsa_pid)) {
+		bluealsa_pid = 0;
+		DIR *dir = opendir("/proc");
+		if (!dir) {
+			return -1;
+		}
+		struct dirent *de;
+		while ((de = readdir(dir)) != NULL) {
+			int pid = atoi(de->d_name);
+			if (pid > 0 && pid_is_bluealsa(pid)) {
+				bluealsa_pid = pid;
+				break;
+			}
+		}
+		closedir(dir);
+		if (bluealsa_pid <= 0) {
+			return -1;
+		}
+	}
+	char path[48];
+	snprintf(path, sizeof(path), "/proc/%d/stat", bluealsa_pid);
+	return stat_ticks(path);
+}
+
+// The interface runs on the process's main thread, whose tid is the pid.
+static long long interface_ticks(void) {
+	char path[64];
+	snprintf(path, sizeof(path), "/proc/self/task/%d/stat", (int)getpid());
+	return stat_ticks(path);
+}
+
+// Percent of the whole machine between two readings, -1 when either is missing.
+static int ticks_percent(long long before, long long after, long long total) {
+	if (before < 0 || after < 0 || total <= 0) {
+		return -1;
+	}
+	return (int)((after - before) * 100 / total);
+}
+
+// ---------------------------------------------------------------------------
+// Who has the core
+//
+// "idle 0%" says the core was busy, not with what, and the three figures
+// beside it -- the playback thread, the interface, bluealsa -- added up to a
+// quarter of it in the 1.2.3 device log: the rest had to be guessed from the
+// code. So every process's clock ticks are noted at the start of a span, and
+// every thread's in this process, where most of the work is, and when the
+// span ends with the core under CPU_TOP_IDLE_PCT idle the ones that grew the
+// most are named on a line of their own. The three already reported are left
+// out of it.
+//
+// A few dozen small reads of /proc every ten seconds, on the playback thread
+// like the readings above: a couple of milliseconds against a buffer of
+// several hundred. Kernel threads are processes like any other here, so a
+// card or a radio driver that is working hard shows by its name (mmcqd,
+// kworker, ksoftirqd).
+// ---------------------------------------------------------------------------
+#define CPU_TOP_MAX 320
+#define CPU_TOP_SHOWN 3
+#define CPU_TOP_IDLE_PCT 30
+#define CPU_TOP_MIN_PCT 2
+
+typedef struct {
+	int id;			   // a pid, or a tid of this process
+	bool thread;	   // ... which one
+	long long ticks;
+} cpu_mark_t;
+
+static cpu_mark_t cpu_marks[CPU_TOP_MAX];
+static int cpu_mark_count;
+static cpu_mark_t cpu_fresh[CPU_TOP_MAX];
+
+// Every process but this one, and this one's threads, into `out`.
+static int cpu_marks_read(cpu_mark_t *out) {
+	int count = 0;
+	int self = (int)getpid();
+	char path[64];
+
+	DIR *tasks = opendir("/proc/self/task");
+	if (tasks) {
+		struct dirent *de;
+		while (count < CPU_TOP_MAX && (de = readdir(tasks)) != NULL) {
+			int tid = atoi(de->d_name);
+			if (tid <= 0) {
+				continue;
+			}
+			snprintf(path, sizeof(path), "/proc/self/task/%d/stat", tid);
+			long long ticks = stat_ticks(path);
+			if (ticks >= 0) {
+				out[count++] = (cpu_mark_t){.id = tid, .thread = true, .ticks = ticks};
+			}
+		}
+		closedir(tasks);
+	}
+
+	DIR *proc = opendir("/proc");
+	if (proc) {
+		struct dirent *de;
+		while (count < CPU_TOP_MAX && (de = readdir(proc)) != NULL) {
+			int pid = atoi(de->d_name);
+			if (pid <= 0 || pid == self) {
+				continue;
+			}
+			snprintf(path, sizeof(path), "/proc/%d/stat", pid);
+			long long ticks = stat_ticks(path);
+			if (ticks >= 0) {
+				out[count++] = (cpu_mark_t){.id = pid, .thread = false, .ticks = ticks};
+			}
+		}
+		closedir(proc);
+	}
+	return count;
+}
+
+static void cpu_marks_take(void) { cpu_mark_count = cpu_marks_read(cpu_marks); }
+
+// "btmon 38%, kworker/0:1 5%, player:coverloader 3%" for a span of
+// `total_ticks`, or nothing when nobody took a noticeable share.
+static void cpu_top_report(long now, long long total_ticks) {
+	if (cpu_mark_count <= 0 || total_ticks <= 0) {
+		return;
+	}
+	int fresh = cpu_marks_read(cpu_fresh);
+	int self_tid = (int)syscall(SYS_gettid);
+	int interface = (int)getpid();
+
+	int top[CPU_TOP_SHOWN];
+	long long top_ticks[CPU_TOP_SHOWN];
+	int shown = 0;
+	int before = 0;
+	for (int i = 0; i < fresh; i++) {
+		const cpu_mark_t *now_mark = &cpu_fresh[i];
+		if (now_mark->thread && (now_mark->id == self_tid || now_mark->id == interface)) {
+			continue; // reported on the lines above
+		}
+		if (!now_mark->thread && now_mark->id == bluealsa_pid) {
+			continue;
+		}
+		// Both lists come out of readdir in the same order, so the match is
+		// almost always where the last one was found.
+		int found = -1;
+		for (int k = 0; k < cpu_mark_count; k++) {
+			int at = (before + k) % cpu_mark_count;
+			if (cpu_marks[at].id == now_mark->id && cpu_marks[at].thread == now_mark->thread) {
+				found = at;
+				break;
+			}
+		}
+		long long grew = now_mark->ticks - (found >= 0 ? cpu_marks[found].ticks : 0);
+		if (found >= 0) {
+			before = found + 1;
+		}
+		if (grew * 100 < total_ticks * CPU_TOP_MIN_PCT) {
+			continue;
+		}
+		// The short list, largest first.
+		if (shown == CPU_TOP_SHOWN && grew <= top_ticks[CPU_TOP_SHOWN - 1]) {
+			continue;
+		}
+		int pos = shown < CPU_TOP_SHOWN ? shown++ : CPU_TOP_SHOWN - 1;
+		while (pos > 0 && top_ticks[pos - 1] < grew) {
+			top[pos] = top[pos - 1];
+			top_ticks[pos] = top_ticks[pos - 1];
+			pos--;
+		}
+		top[pos] = i;
+		top_ticks[pos] = grew;
+	}
+	if (shown == 0) {
+		return;
+	}
+
+	char text[256];
+	size_t used = 0;
+	for (int n = 0; n < shown && used < sizeof(text); n++) {
+		const cpu_mark_t *m = &cpu_fresh[top[n]];
+		char path[64], comm[32] = "?";
+		if (m->thread) {
+			snprintf(path, sizeof(path), "/proc/self/task/%d/comm", m->id);
+		} else {
+			snprintf(path, sizeof(path), "/proc/%d/comm", m->id);
+		}
+		FILE *f = fopen(path, "r");
+		if (f) {
+			if (fgets(comm, sizeof(comm), f)) {
+				comm[strcspn(comm, "\n")] = '\0';
+			}
+			fclose(f);
+		}
+		int len = snprintf(text + used, sizeof(text) - used, "%s%s%s %lld%%", n ? ", " : "", m->thread ? "player:" : "",
+						   comm, top_ticks[n] * 100 / total_ticks);
+		if (len < 0) {
+			break;
+		}
+		used += (size_t)len;
+	}
+	fprintf(stderr, "audio[%ld]: the core went to: %s\n", now, text);
+}
+
+static void health_sample_system(health_t *h) {
+	if (!system_ticks(&h->sys_total, &h->sys_idle)) {
+		h->sys_total = h->sys_idle = -1;
+	}
+	h->ui_ticks = interface_ticks();
+	h->bluealsa_ticks = output_is_bluetooth() ? bluealsa_ticks() : -1;
+	cpu_marks_take();
+}
+
+static void health_start(health_t *h) {
+	health_sample_system(h);
+	h->at_ms = log_ms();
+	h->cpu_ns = thread_cpu_ns();
+	h->recoveries = write_recoveries;
+	memset(h->stage_ns, 0, sizeof(h->stage_ns));
+	h->lap_ns = h->cpu_ns;
+}
+
+// health_mark() at the top of a turn, then health_lap() after each stage.
+static void health_mark(health_t *h) { h->lap_ns = thread_cpu_ns(); }
+
+static void health_lap(health_t *h, stage_t stage) {
+	int64_t now = thread_cpu_ns();
+	h->stage_ns[stage] += now - h->lap_ns;
+	h->lap_ns = now;
+}
+
+// Tenths of a percent of the core over `span_ms`.
+static int health_permille(int64_t ns, long span_ms) { return (int)(ns / 1000 / span_ms); }
+
+// Called after every write. A window stretched by a pause says nothing about
+// playing, so it is restarted instead of reported.
+static void health_tick(health_t *h, int rate, int out_rate, int bits) {
+	long now = log_ms();
+	long span = now - h->at_ms;
+	if (span < HEALTH_PERIOD_MS) {
+		return;
+	}
+	if (span < 2 * HEALTH_PERIOD_MS) {
+		int64_t used = thread_cpu_ns() - h->cpu_ns;
+		int all = health_permille(used, span);
+		int rd = health_permille(h->stage_ns[STAGE_READ], span);
+		int fx = health_permille(h->stage_ns[STAGE_EFFECTS], span);
+		int wr = health_permille(h->stage_ns[STAGE_WRITE], span);
+		char to[32] = "";
+		if (out_rate != rate) {
+			snprintf(to, sizeof(to), " (%d Hz out)", out_rate);
+		}
+		fprintf(stderr,
+				"audio[%ld]: %ld s at %d Hz%s / %d bit: playback thread %d.%d%% of the core (read+decode %d.%d%%, "
+				"effects %d.%d%%, ALSA write %d.%d%%), %u write recoveries, MemAvailable %ld kB\n",
+				now, span / 1000, rate, to, bits, all / 10, all % 10, rd / 10, rd % 10, fx / 10, fx % 10, wr / 10,
+				wr % 10, write_recoveries - h->recoveries, mem_available_kb());
+
+		long long total = 0, idle = 0;
+		if (h->sys_total >= 0 && system_ticks(&total, &idle) && total > h->sys_total) {
+			long long dt = total - h->sys_total;
+			int idle_pct = (int)((idle - h->sys_idle) * 100 / dt);
+			int ui_pct = ticks_percent(h->ui_ticks, interface_ticks(), dt);
+			int ba_pct = h->bluealsa_ticks >= 0 ? ticks_percent(h->bluealsa_ticks, bluealsa_ticks(), dt) : -1;
+			char ba[32] = "";
+			if (ba_pct >= 0) {
+				snprintf(ba, sizeof(ba), ", bluealsa %d%%", ba_pct);
+			}
+			fprintf(stderr, "audio[%ld]: the core over the same span: idle %d%%, interface %d%%%s\n", now, idle_pct,
+					ui_pct, ba);
+			if (idle_pct < CPU_TOP_IDLE_PCT) {
+				cpu_top_report(now, dt);
+			}
+		}
+	}
+	health_start(h);
+}
+
+// Writes one buffer of frames, recovering from the errors a real device
+// throws instead of killing the track on the first one:
+//
+//   -EPIPE    underrun -> prepare and rewrite
+//   -ESTRPIPE the device was suspended -> resume (then prepare) and rewrite
+//   -EIO      the stream went bad underneath -- on this hardware an
+//             output-route switch (headphones in/out, line-out toggle) can
+//             invalidate the open stream -- so the device is closed and
+//             reopened from scratch, then the write retried
+//
+// Returns the frames written, or negative once recovery has failed several
+// times in a row; *pcm may be replaced (or NULL) on return.
+static bool playback_reader_should_abort(void);
+
+// How long a write to a Bluetooth PCM may make no progress before the link is
+// taken for gone. The same two seconds the wait below already used for a card
+// with a stopped clock: long enough for a hiccup on the air, short enough that
+// the queue does not stand still.
+#define BT_WRITE_STALL_MS 2000
+
+// After a seek on a Bluetooth PCM: one line, a second and a half later, saying
+// how much audio is queued.
+//
+// It separates the two possible explanations of stuttering after a seek. A full
+// queue (around 700 ms) means the player is keeping up and the trouble is on
+// the air or in the sink; a queue near zero means it is not keeping up, and the
+// place to look is here. From outside the two look identical.
+//
+// Bluetooth only, after a seek only, once per seek.
+#define BT_SEEK_PROBE_MS 1500
+static long bt_seek_probe_at;
+
+// How long a track takes to start COMING OUT, on the headphones.
+//
+// Two different causes look identical from outside, and this tells them apart:
+//
+//   * the stream starts and simply is not heard -- the link is the place to
+//     look, and this line says RUNNING after a few hundred ms;
+//   * the stream never starts, because the start threshold is the whole buffer
+//     (some seven hundred milliseconds of audio) and the CPU does not fill it
+//     fast enough -- and this line says PREPARED, and for how long.
+//
+// One line per track, bluealsa only, like the seek probe. RUNNING says only
+// that the plugin started, not that anything is consuming: if the A2DP stream
+// is not really streaming, the frames sit in bluealsa's queue. A second line
+// shortly after carries the queue depth, and a queue that stays full means
+// nothing on the other side is taking anything away.
+#define BT_START_GIVEUP_MS 5000
+#define BT_START_FLOW_MS 2000
+static long bt_start_at;
+static long bt_start_flow_at;
+static bool bt_start_said;
+static long long bt_start_frames;
+static int bt_start_rate;
+
+// The A2DP stream state, as bluez has it, appended to the lines below.
+//
+// Everything this file can see says the same thing whether the headphones are
+// playing or not: the writes go through, the queue drains at the right rate,
+// the encoder keeps up. Only bluez knows whether the stream those frames are
+// encoded into is active, and a stream that is idle or pending renders nothing
+// however perfectly it is fed. Asked for at the start and read two seconds
+// later, off the worker, because the playback thread does not wait on D-Bus.
+static void bt_streams_text(char *out, size_t size) {
+	char streams[192];
+	int age = -1;
+	if (bluetooth_a2dp_streams(streams, (int)sizeof(streams), &age) && streams[0]) {
+		snprintf(out, size, "; A2DP stream %s (read %d ms ago)", streams, age);
+	} else {
+		out[0] = '\0';
+	}
+}
+
+static void bt_start_probe_arm(snd_pcm_t *pcm) {
+	bt_start_at = (pcm && pcm_is_bluetooth(pcm)) ? log_ms() : 0;
+	bt_start_flow_at = 0;
+	bt_start_said = false;
+	bt_start_frames = 0;
+	bt_start_rate = 0;
+	if (bt_start_at) {
+		bluetooth_request_a2dp_streams();
+	}
+}
+
+static void bt_start_probe_note(snd_pcm_t *pcm, snd_pcm_sframes_t written, int rate) {
+	if (!bt_start_at || !pcm) {
+		return;
+	}
+	if (written > 0) {
+		bt_start_frames += written;
+	}
+	bt_start_rate = rate;
+	long now = log_ms();
+
+	if (bt_start_said) {
+		if (bt_start_flow_at && now >= bt_start_flow_at) {
+			long elapsed = now - bt_start_at;
+			bt_start_flow_at = 0;
+			snd_pcm_sframes_t queued = 0;
+			if (snd_pcm_delay(pcm, &queued) < 0) {
+				queued = -1;
+			}
+			// Written minus still queued is what the encoder has taken. Against
+			// the frames the elapsed time is worth, it says in one number
+			// whether anything is consuming the stream.
+			long long taken = bt_start_frames - (queued > 0 ? queued : 0);
+			long long realtime = rate > 0 ? (long long)((double)rate * elapsed / 1000.0) : 0;
+			char streams[224];
+			bt_streams_text(streams, sizeof(streams));
+			fprintf(stderr,
+					"audio[%ld]: %ld ms after the start: %lld frames written, %ld queued, %lld taken out of %lld of real "
+					"time%s\n",
+					now, elapsed, bt_start_frames, (long)queued, taken, realtime, streams);
+		}
+		return;
+	}
+
+	long elapsed = now - bt_start_at;
+	snd_pcm_state_t state = snd_pcm_state(pcm);
+	if (state == SND_PCM_STATE_RUNNING) {
+		bt_start_said = true;
+		bt_start_flow_at = now + BT_START_FLOW_MS;
+		// Asked again here so the line below reads an answer from after the
+		// stream started, not one from before the PCM was even open.
+		bluetooth_request_a2dp_streams();
+		fprintf(stderr, "audio[%ld]: the track started coming out after %ld ms (%lld frames written)\n", now, elapsed,
+				bt_start_frames);
+		return;
+	}
+	if (elapsed >= BT_START_GIVEUP_MS) {
+		bt_start_said = true;
+		char streams[224];
+		bt_streams_text(streams, sizeof(streams));
+		fprintf(stderr, "audio[%ld]: after %ld ms the track has still not come out (state %s, %lld frames written)%s\n",
+				now, elapsed, snd_pcm_state_name(state), bt_start_frames, streams);
+	}
+}
+
+static void bt_seek_probe_arm(snd_pcm_t *pcm) {
+	bt_seek_probe_at = (pcm && pcm_is_bluetooth(pcm)) ? log_ms() + BT_SEEK_PROBE_MS : 0;
+}
+
+static void bt_seek_probe_cancel(void) { bt_seek_probe_at = 0; }
+
+static void bt_seek_probe_report(snd_pcm_t *pcm) {
+	if (!bt_seek_probe_at || log_ms() < bt_seek_probe_at) {
+		return;
+	}
+	bt_seek_probe_at = 0;
+	if (!pcm) {
+		return;
+	}
+	snd_pcm_sframes_t queued = 0;
+	if (snd_pcm_delay(pcm, &queued) < 0) {
+		queued = -1;
+	}
+	fprintf(stderr, "audio[%ld]: %d ms after the seek the Bluetooth queue is %ld frames (state %s)\n", log_ms(),
+			BT_SEEK_PROBE_MS, (long)queued, snd_pcm_state_name(snd_pcm_state(pcm)));
+}
+
+// Waits up to `timeout_ms` for room in a bluealsa PCM: 1 with room, 0 without,
+// negative on an error.
+//
+// Not snd_pcm_wait(). Its loop in alsa-lib calls poll() again, with the full
+// timeout, whenever poll() reports a descriptor ready but the plugin's revents
+// hold neither POLLIN nor POLLOUT, and never sleeps in between. The bluealsa
+// plugin polls an event fd and its D-Bus connection alongside the PCM, and
+// either can be readable while the PCM has no room: the caller, at real-time
+// priority on the one core, then spins inside alsa-lib and nothing below it
+// runs again -- not the interface, not the card's I/O, not the kernel threads.
+// Here one poll() is made per call, and a readiness that is not room is
+// answered with a sleep.
+#define BT_POLL_FDS_MAX 8
+#define BT_SPURIOUS_SLEEP_US (5 * 1000)
+
+static int pcm_wait_bluetooth(snd_pcm_t *pcm, int timeout_ms) {
+	struct pollfd pfd[BT_POLL_FDS_MAX];
+	int count = snd_pcm_poll_descriptors_count(pcm);
+	if (count <= 0 || count > BT_POLL_FDS_MAX) {
+		usleep(BT_SPURIOUS_SLEEP_US);
+		return 0;
+	}
+	count = snd_pcm_poll_descriptors(pcm, pfd, (unsigned)count);
+	if (count <= 0) {
+		usleep(BT_SPURIOUS_SLEEP_US);
+		return 0;
+	}
+	int ready = poll(pfd, (nfds_t)count, timeout_ms);
+	if (ready < 0) {
+		return errno == EINTR ? 0 : -errno;
+	}
+	if (ready == 0) {
+		return 0;
+	}
+	unsigned short revents = 0;
+	int err = snd_pcm_poll_descriptors_revents(pcm, pfd, (unsigned)count, &revents);
+	if (err < 0) {
+		return err;
+	}
+	if (revents & (POLLERR | POLLNVAL)) {
+		return -EIO;
+	}
+	if (revents & POLLOUT) {
+		return 1;
+	}
+	usleep(BT_SPURIOUS_SLEEP_US);
+	return 0;
+}
+
+// Writes a whole period to a bluealsa PCM without ever blocking indefinitely.
+//
+// snd_pcm_writei() on a blocking handle waits for room, and over A2DP that room
+// can stop coming for good -- there is no clock consuming the buffer, only a
+// link that may have gone away, and the playback thread parks in poll() with a
+// play request pending and no track ever starting. The wait above catches the
+// case where the stream is RUNNING and the poll says nothing; it does not catch
+// the write itself deciding to wait.
+//
+// So the Bluetooth PCM is opened non-blocking (open_pcm_device) and the waiting
+// is done here, in slices, with a deadline. A partial write is not a loss here:
+// the rest of the period is written on the next turn round the loop.
+static snd_pcm_sframes_t pcm_write_bluetooth(snd_pcm_t *pcm, const void *buf, snd_pcm_uframes_t frames,
+											 int frame_bytes) {
+	const char *from = (const char *)buf;
+	snd_pcm_uframes_t done = 0;
+	long last_progress_ms = log_ms();
+
+	while (done < frames) {
+		snd_pcm_sframes_t n = snd_pcm_writei(pcm, from + done * (size_t)frame_bytes, frames - done);
+		if (n > 0) {
+			done += (snd_pcm_uframes_t)n;
+			last_progress_ms = log_ms();
+			continue;
+		}
+		if (n < 0 && n != -EAGAIN) {
+			// A real error (-EPIPE, -ESTRPIPE, -ENODEV...): the caller knows
+			// how to recover from each, and knows nothing about what has
+			// already gone out, so anything written so far is reported first.
+			return done > 0 ? (snd_pcm_sframes_t)done : n;
+		}
+
+		// No room -- either -EAGAIN, or a write that took nothing and said so
+		// without complaining. A command waiting is a better reason to come
+		// back than any deadline: whoever pressed stop or next is not waiting
+		// for this.
+		if (playback_reader_should_abort()) {
+			return done > 0 ? (snd_pcm_sframes_t)done : -EINTR;
+		}
+
+		// The deadline is read off the clock, and not from how the wait below
+		// came back. Counting only the polls that TIMED OUT would leave one way
+		// through with no deadline at all: a poll that keeps saying "there is
+		// room" while the write keeps saying there is not. bluealsa answers
+		// exactly that way -- its poll follows the FIFO, the write follows the
+		// transport, and the two disagree the moment the link stops draining --
+		// so an indefinite block would simply become an indefinite spin.
+		long since = log_ms() - last_progress_ms;
+		if (since < 0) {
+			since = 0; // the millisecond counter wrapped; start the window again
+			last_progress_ms = log_ms();
+		}
+		if (since >= BT_WRITE_STALL_MS) {
+			fprintf(stderr, "audio[%ld]: the Bluetooth PCM has taken nothing for %ld ms: calling it lost\n",
+					log_ms(), since);
+			return done > 0 ? (snd_pcm_sframes_t)done : -EIO;
+		}
+
+		int ready = pcm_wait_bluetooth(pcm, 100);
+		if (ready < 0) {
+			return done > 0 ? (snd_pcm_sframes_t)done : (snd_pcm_sframes_t)ready;
+		}
+		if (ready > 0) {
+			// Told there is room by a poll the write has just contradicted.
+			// Ten milliseconds, so a disagreement that lasts becomes a wait and
+			// not a thread spinning on one core against a device that is not
+			// listening.
+			usleep(10 * 1000);
+		}
+	}
+	return (snd_pcm_sframes_t)done;
+}
+
+// The playback thread is real-time only while a stream is playing.
+//
+// Real-time is what keeps a playing stream fed whatever the interface is
+// doing. But a stream that is not running yet -- a track starting, a seek, a
+// resume, a recovery -- is filled from empty in one go: the start threshold is
+// the whole buffer, so nothing is written to the card until it is full, and
+// no write blocks on the way. At 192 kHz that is most of a second of audio
+// decoded, run through the effects and written without a pause, on the one
+// core, ahead of the interface -- right as the now-playing screen slides in.
+// Opening the device is worse: the codec's power-up and reset are busy waits
+// in the driver (more than a hundred milliseconds of them), and a real-time
+// caller holds the core through every one.
+//
+// Nothing is playing in either case, so there is nothing for the priority to
+// protect: the thread steps down to the interface's level until the stream
+// starts, and goes back up from the first write that finds it running.
+#define PLAYBACK_RT_PRIORITY 10
+
+static bool playback_rt;
+
+// The stream the thread's priority follows, its buffer, and how much has been
+// written to it since it last stopped playing.
+static snd_pcm_t *follow_pcm;
+
+// ---------------------------------------------------------------------------
+// The link between this player and bluealsa
+//
+// A Bluetooth stream crosses three threads on its way out: this playback
+// thread fills the PCM's buffer (SCHED_RR 10 while it plays), bluealsa's
+// encoder empties the daemon's FIFO (SCHED_FIFO 12 with io_rt_priority, see
+// bluetooth.c) -- and between the two, inside this process, the ALSA plugin's
+// own "pcm-io" thread copies the buffer into the FIFO at the pace of the
+// clock.
+//
+// That middle thread is created by snd_pcm_start(), which runs inside the
+// write that fills the buffer -- the one moment this thread is deliberately
+// NOT real-time (see above) -- and a new thread takes the creator's
+// scheduling. So the one link of the chain that has to keep time ran at the
+// interface's level, and anything that keeps the core busy for a while (a
+// download's TLS and card writes, a flood of log lines) starved it: the
+// encoder ran dry, and when the thread got the core back it caught up in one
+// burst, emptied the buffer and reported an underrun. The 1.2.3 device log has
+// both: "write error: Broken pipe" during a Yandex download under LDAC 990,
+// and again in a five-second freeze with the core never idle.
+//
+// So once a Bluetooth stream is running, its pcm-io thread is put between the
+// two others, at SCHED_RR 11. It sleeps between periods and blocks on the
+// FIFO, so this costs no time; it only decides who goes first.
+// ---------------------------------------------------------------------------
+#define BT_IO_RT_PRIORITY (PLAYBACK_RT_PRIORITY + 1)
+
+static void bluetooth_io_thread_rt(void) {
+#ifndef HOST_BUILD
+	DIR *tasks = opendir("/proc/self/task");
+	if (!tasks) {
+		return;
+	}
+	struct dirent *de;
+	while ((de = readdir(tasks)) != NULL) {
+		pid_t tid = (pid_t)atoi(de->d_name);
+		if (tid <= 0) {
+			continue;
+		}
+		char path[64], comm[32] = "";
+		snprintf(path, sizeof(path), "/proc/self/task/%d/comm", (int)tid);
+		FILE *f = fopen(path, "re");
+		if (!f) {
+			continue;
+		}
+		bool io = fgets(comm, sizeof(comm), f) && strcmp(comm, "pcm-io\n") == 0;
+		fclose(f);
+		if (!io || sched_getscheduler(tid) == SCHED_RR) {
+			continue;
+		}
+		struct sched_param param = {.sched_priority = BT_IO_RT_PRIORITY};
+		if (sched_setscheduler(tid, SCHED_RR, &param) == 0) {
+			fprintf(stderr, "audio[%ld]: bluealsa's pcm-io thread %d at SCHED_RR %d\n", log_ms(), (int)tid,
+					BT_IO_RT_PRIORITY);
+		} else {
+			fprintf(stderr, "audio: bluealsa's pcm-io thread %d stays at normal priority: %s\n", (int)tid,
+					strerror(errno));
+		}
+	}
+	closedir(tasks);
+#endif
+}
+
+static void playback_set_rt(bool on) {
+	if (on == playback_rt) {
+		return;
+	}
+	struct sched_param param = {.sched_priority = on ? PLAYBACK_RT_PRIORITY : 0};
+	if (pthread_setschedparam(pthread_self(), on ? SCHED_RR : SCHED_OTHER, &param) == 0) {
+		playback_rt = on;
+	}
+	// The stream has just started: on Bluetooth that is when the plugin's
+	// thread exists, freshly made at the level this one had a moment ago.
+	if (on && follow_pcm && pcm_is_bluetooth(follow_pcm)) {
+		bluetooth_io_thread_rt();
+	}
+}
+static snd_pcm_uframes_t follow_buffer;
+static snd_pcm_uframes_t follow_filled;
+
+static bool pcm_playing(snd_pcm_t *pcm) {
+	snd_pcm_state_t st = snd_pcm_state(pcm);
+	return st == SND_PCM_STATE_RUNNING || st == SND_PCM_STATE_DRAINING;
+}
+
+// Real-time while `pcm` plays, the interface's level otherwise. NULL is a
+// device about to be opened. A whole buffer written also counts as playing,
+// whatever the state says: the stream starts on a full buffer, so by then it
+// is either running or about to, and a PCM that never reports it does not
+// leave the thread below the interface for the length of a track.
+static void playback_follow(snd_pcm_t *pcm) {
+	if (pcm != follow_pcm) {
+		follow_pcm = pcm;
+		follow_filled = 0;
+		follow_buffer = 0;
+		snd_pcm_uframes_t period = 0;
+		if (pcm && snd_pcm_get_params(pcm, &follow_buffer, &period) < 0) {
+			follow_buffer = 0;
+		}
+	}
+	if (!pcm) {
+		playback_set_rt(false);
+		return;
+	}
+	if (pcm_playing(pcm)) {
+		follow_filled = 0;
+		playback_set_rt(true);
+		return;
+	}
+	playback_set_rt(follow_buffer > 0 && follow_filled >= follow_buffer);
+}
+
+// After a write of `frames` to `pcm`.
+static void playback_wrote(snd_pcm_t *pcm, snd_pcm_uframes_t frames) {
+	if (pcm == follow_pcm && !pcm_playing(pcm)) {
+		follow_filled += frames;
+	}
+	playback_follow(pcm);
+}
+
+// Commands interrupt the hardware wait instead of waiting for another period.
+// Bluetooth keeps its separate bounded wait and transport-stall handling.
+static int playback_wake_fd = -1;
+
+static void playback_wake(void) {
+	uint64_t one = 1;
+	if (playback_wake_fd >= 0) {
+		while (write(playback_wake_fd, &one, sizeof(one)) < 0 && errno == EINTR) {
+		}
+		// EAGAIN means a wake-up is already pending.
+	}
+}
+
+static uint64_t paused_clock_ms(void) {
+	struct timespec now;
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	return (uint64_t)now.tv_sec * 1000U + (uint64_t)now.tv_nsec / 1000000U;
+}
+
+// Playback thread only. A flush is consumed after the actual local/held close,
+// including a coalesced request that arrived while the close was in progress.
+static void paused_release_due(snd_pcm_t **pcm, uint64_t paused_at_ms) {
+	pthread_mutex_lock(&audio_mutex);
+	bool flush = hold_flush_request;
+	pthread_mutex_unlock(&audio_mutex);
+	if (*pcm && (flush || atomic_load(&paused_release_wanted) ||
+				 paused_clock_ms() - paused_at_ms >= (uint64_t)paused_device_close_ms())) {
+		snd_pcm_close(*pcm);
+		*pcm = NULL;
+		pcm_device_open = false;
+		playback_follow(NULL);
+		fprintf(stderr, "audio[%ld]: device released while paused (DAC powered down)\n", log_ms());
+	}
+	pthread_mutex_lock(&audio_mutex);
+	flush = hold_flush_request;
+	pthread_mutex_unlock(&audio_mutex);
+	if (flush) {
+		gapless_release();
+		pthread_mutex_lock(&audio_mutex);
+		if (!*pcm && !gapless_holding()) {
+			hold_flush_request = false;
+		}
+		pthread_mutex_unlock(&audio_mutex);
+	}
+}
+
+// Waits, never owns a PCM. The eventfd retains commands between the predicate
+// check and poll. Its counter is a notification; the mailbox remains truth.
+static void paused_wait(bool local_pcm_open, uint64_t paused_at_ms) {
+	int timeout = -1;
+	if (local_pcm_open) {
+		uint64_t limit = (uint64_t)paused_device_close_ms();
+		uint64_t elapsed = paused_clock_ms() - paused_at_ms;
+		if (elapsed >= limit) {
+			return;
+		}
+		timeout = (int)(limit - elapsed);
+	}
+	pthread_mutex_lock(&audio_mutex);
+	bool pending = audio_command != AUDIO_CMD_PAUSE || play_request || seek_request || stop_thread ||
+				   resume_recover_pending || hold_flush_request ||
+				   (local_pcm_open && atomic_load(&paused_release_wanted));
+	pthread_mutex_unlock(&audio_mutex);
+	if (pending) {
+		return;
+	}
+	bool fallback = playback_wake_fd < 0;
+	if (!fallback) {
+		struct pollfd waiting = {.fd = playback_wake_fd, .events = POLLIN};
+		int ready = poll(&waiting, 1, timeout);
+		if (!ready || (ready < 0 && errno == EINTR)) {
+			return;
+		}
+		if (ready > 0 && (waiting.revents & POLLIN) &&
+			!(waiting.revents & (POLLERR | POLLHUP | POLLNVAL))) {
+			uint64_t count;
+			ssize_t got;
+			do {
+				got = read(playback_wake_fd, &count, sizeof(count));
+			} while (got < 0 && errno == EINTR);
+			if (got == (ssize_t)sizeof(count) || (got < 0 && errno == EAGAIN)) {
+				return;
+			}
+		}
+		static bool error_logged;
+		if (!error_logged) {
+			error_logged = true;
+			fprintf(stderr, "audio: pause wake failed; using bounded waits\n");
+		}
+		fallback = true;
+	}
+	if (fallback) {
+		usleep(local_pcm_open ? 50000 : 200000);
+	}
+}
+
+// One poll only: ALSA plugins can report readiness without actual PCM room.
+// A command takes precedence when both the PCM and the eventfd are ready.
+static int pcm_wait_or_wake(snd_pcm_t *pcm, int timeout_ms) {
+	struct pollfd fds[9];
+	int n = snd_pcm_poll_descriptors_count(pcm);
+	if (playback_wake_fd < 0 || n <= 0 || n >= (int)(sizeof(fds) / sizeof(fds[0]))) {
+		return snd_pcm_wait(pcm, timeout_ms);
+	}
+	n = snd_pcm_poll_descriptors(pcm, fds, (unsigned int)n);
+	if (n <= 0 || n >= (int)(sizeof(fds) / sizeof(fds[0]))) {
+		return snd_pcm_wait(pcm, timeout_ms);
+	}
+	fds[n] = (struct pollfd){.fd = playback_wake_fd, .events = POLLIN};
+	int r = poll(fds, (nfds_t)n + 1, timeout_ms);
+	if (r < 0) {
+		return errno == EINTR ? 0 : -errno;
+	}
+	if (!r) {
+		return 0;
+	}
+	if (fds[n].revents & POLLIN) {
+		uint64_t count;
+		if (read(playback_wake_fd, &count, sizeof(count)) < 0) {
+			// A concurrent drain or signal leaves the command check authoritative.
+		}
+		return 0;
+	}
+	unsigned short revents = 0;
+	int err = snd_pcm_poll_descriptors_revents(pcm, fds, (unsigned int)n, &revents);
+	if (err < 0) {
+		return err;
+	}
+	if (revents & (POLLERR | POLLNVAL | POLLHUP)) {
+		return -EIO;
+	}
+	if (revents & POLLOUT) {
+		return 1;
+	}
+	// A plugin can keep its event fd ready without PCM room. Yield the single
+	// core before retrying, just as the Bluetooth-specific wait already does.
+	usleep(BT_SPURIOUS_SLEEP_US);
+	return 0;
+}
+
+static snd_pcm_sframes_t pcm_write_recover(snd_pcm_t **pcm, const void *buf, snd_pcm_uframes_t frames, int channels,
+										   int rate, int bits, snd_pcm_uframes_t *period) {
+	for (int attempt = 0; attempt < 8; attempt++) {
+		if (!*pcm) {
+			return -EIO; // a previous recovery closed it and could not get it back
+		}
+		playback_follow(*pcm);
+
+		// Never write blind to a RUNNING stream. The blocking writei waits for
+		// room in the card's buffer; after a storm of underruns this hardware
+		// can sit with a full buffer and a stopped clock, and that room never
+		// frees again, leaving the thread inside ALSA out of reach of any
+		// wake-up.
+		//
+		// But waiting only makes sense while the card is consuming: consumption
+		// is what frees room, and a stopped clock is what the wait is meant to
+		// detect. On a freshly PREPARED stream -- track start, post-seek,
+		// post-underrun -- this driver's poll signals nothing until the stream
+		// has started, so waiting there would declare a healthy device stuck and
+		// close it. A write to a prepared stream cannot block: the room is there
+		// by definition, and the write is what starts it.
+		bool room = true;
+		snd_pcm_state_t pcm_state = snd_pcm_state(*pcm);
+		if (pcm_state == SND_PCM_STATE_RUNNING || pcm_state == SND_PCM_STATE_DRAINING) {
+			room = false;
+			bool bluetooth = pcm_is_bluetooth(*pcm);
+			long give_up_at = log_ms() + 2000;
+			while (!room && log_ms() < give_up_at) {
+				if (playback_reader_should_abort()) {
+					return -EINTR; // a command is pending: the main loop handles it
+				}
+				int r = bluetooth ? pcm_wait_bluetooth(*pcm, 100) : pcm_wait_or_wake(*pcm, 100);
+				if (r != 0) {
+					room = true; // ready (1) or error (<0): the writei will say which
+				}
+			}
+		}
+
+		// Readiness and a command can arrive together. Do not feed another block
+		// after pause/seek/stop merely because the PCM also reported room.
+		if (playback_reader_should_abort()) {
+			return -EINTR;
+		}
+		snd_pcm_sframes_t written;
+		if (!room) {
+			fprintf(stderr, "audio[%ld]: buffer never free in 2 s: device wedged, rebuilding it\n", log_ms());
+			written = -EIO; // skip the writei and go straight to the rebuild
+		} else if (pcm_is_bluetooth(*pcm)) {
+			written = pcm_write_bluetooth(*pcm, buf, frames, channels * (bits / 8));
+		} else if (pcm_takes_s24(*pcm, bits)) {
+			const void *s24 = s24_from_s32(&playback_s24, buf, (size_t)frames * (size_t)channels);
+			written = s24 ? snd_pcm_writei(*pcm, s24, frames) : -ENOMEM;
+		} else {
+			written = snd_pcm_writei(*pcm, buf, frames);
+		}
+		if (written >= 0) {
+			playback_wrote(*pcm, (snd_pcm_uframes_t)written);
+			return written;
+		}
+
+		write_recoveries++;
+		fprintf(stderr, "audio[%ld]: write error: %s (recovery %d)\n", log_ms(), snd_strerror((int)written),
+				attempt + 1);
+
+		if (written == -EPIPE) {
+			snd_pcm_prepare(*pcm);
+			continue;
+		}
+		if (written == -ESTRPIPE) {
+			int r = -EAGAIN;
+			for (int t = 0; r == -EAGAIN && t < 20; t++) {
+				r = snd_pcm_resume(*pcm);
+				if (r == -EAGAIN) {
+					usleep(100 * 1000);
+				}
+			}
+			if (r < 0) {
+				snd_pcm_prepare(*pcm);
+			}
+			continue;
+		}
+
+		// -EIO and anything else: rebuild the device from scratch. The stall
+		// that produces the EIO (a busy DMA, a route settling) needs a real
+		// moment to clear, so the backoff grows with each attempt; reopening
+		// immediately only earns another EIO.
+		snd_pcm_close(*pcm);
+		*pcm = NULL;
+		playback_follow(NULL);
+		usleep((attempt + 1) * 150 * 1000);
+		// The route, not just the PCM. Reopening the stream without redoing the
+		// codec routing leaves the DAC in a state where high-rate streams never
+		// start again -- 96 kHz tracks die while 48 kHz ones still play -- and
+		// only a reboot clears it. Same move as pcm_reroute, for the same
+		// reason.
+		auto_set_output();
+		*pcm = open_pcm_device(channels, rate, bits, period, NULL);
+		if (!*pcm) {
+			return written; // it really is gone
+		}
+		fprintf(stderr, "audio[%ld]: pcm reopened (recovery %d)\n", log_ms(), attempt + 1);
+	}
+	return -EIO;
+}
+
+
+
+// Mid-track jack change (headphones in/out while playing): the stock engine
+// sets a reinit flag and its device layer reopens on the new route; this is
+// the same move between two writes -- the only moment no stream is live, so
+// the codec switch cannot stall anything.
+static bool pcm_reroute(snd_pcm_t **pcm, int channels, int rate, int bits, snd_pcm_uframes_t *period) {
+	fprintf(stderr, "audio[%ld]: jack changed, rerouting\n", log_ms());
+	if (*pcm) {
+		snd_pcm_drop(*pcm);
+		snd_pcm_close(*pcm);
+		*pcm = NULL;
+	}
+	playback_follow(NULL);
+	usleep(150 * 1000); // let the switch settle before the codec is poked
+	auto_set_output();
+	*pcm = open_pcm_device(channels, rate, bits, period, NULL);
+	return *pcm != NULL;
+}
+
+// Caller holds audio_mutex. Re-check after each unlocked driver phase.
+static bool resume_request_cancelled(unsigned serial) {
+	return serial != resume_request_serial || play_request || stop_thread || seek_request ||
+		   hold_flush_request || resume_recover_pending || audio_command != AUDIO_CMD_PLAY;
+}
+
+// Enter and return with audio_mutex held. The playback thread remains the
+// sole owner of the handle while slow driver work runs without the UI lock.
+static bool reopen_paused_pcm(snd_pcm_t **pcm, int channels, int rate, int bits, snd_pcm_uframes_t *period, bool exact_rate) {
+	unsigned serial = resume_request_serial;
+	// A fresh open replaces recovery of the old suspended handle.
+	resume_recover_pending = false;
+	pthread_mutex_unlock(&audio_mutex);
+	if (*pcm) {
+		snd_pcm_close(*pcm);
+		*pcm = NULL;
+		pcm_device_open = false;
+		playback_follow(NULL);
+		// Preserve the driver's close/open settling interval.
+		usleep(150 * 1000);
+	}
+	pthread_mutex_lock(&audio_mutex);
+	if (resume_request_cancelled(serial)) {
+		// Do not touch a receiver's output after Stop during the settling wait.
+		pthread_mutex_unlock(&audio_mutex);
+		paused_release_due(pcm, paused_clock_ms());
+		pthread_mutex_lock(&audio_mutex);
+		return false;
+	}
+	pthread_mutex_unlock(&audio_mutex);
+	int route = alsa_output_key();
+	char device[sizeof(output_pcm)];
+	audio_get_output_device(device, sizeof(device));
+	auto_set_output();
+	pcm_exact_rate = exact_rate;
+	*pcm = open_pcm_device(channels, rate, bits, period, NULL);
+	pcm_exact_rate = false;
+	char current_device[sizeof(output_pcm)];
+	audio_get_output_device(current_device, sizeof(current_device));
+	bool same_output = route == alsa_output_key() && !strcmp(device, current_device);
+	pthread_mutex_lock(&audio_mutex);
+	if (!same_output || resume_request_cancelled(serial)) {
+		// Do not publish or use a late handle, and never replace the new command
+		// with an old open failure. Close on this same owner without the UI lock.
+		pthread_mutex_unlock(&audio_mutex);
+		if (*pcm) {
+			snd_pcm_close(*pcm);
+			*pcm = NULL;
+			pcm_device_open = false;
+			playback_follow(NULL);
+			// A cancelled open can be retried in this same track loop too.
+			usleep(150 * 1000);
+		}
+		// A quiesce request is acknowledged only after the actual close.
+		// Reuse the pause path so a pending flush cannot cause reopen spinning.
+		paused_release_due(pcm, paused_clock_ms());
+		pthread_mutex_lock(&audio_mutex);
+		return false;
+	}
+	if (!*pcm) {
+		fprintf(stderr, "Audio: cannot reopen the device after a pause\n");
+		audio_command = AUDIO_CMD_PAUSE;
+		playback_status = AUDIO_STATUS_PAUSED;
+		return false;
+	}
+	return true;
+}
+
+// A write failure that survived every in-place recovery still gets one clean
+// retry of the whole track: close everything, pause, and play the same file
+// again from the top, so a failed start costs a half-second hiccup rather than
+// silence. One retry only, then a real stop.
+static bool retry_track_once(const char *filepath, const char *reason) {
+	pthread_mutex_lock(&audio_mutex);
+	if (write_fail_retry_used) {
+		pthread_mutex_unlock(&audio_mutex);
+		return false;
+	}
+	write_fail_retry_used = true;
+	strncpy(current_filepath, filepath, sizeof(current_filepath) - 1);
+	current_filepath[sizeof(current_filepath) - 1] = '\0';
+	play_request = true;
+	play_request_ms = log_ms();
+	audio_command = AUDIO_CMD_PLAY;
+	playback_status = AUDIO_STATUS_PLAYING;
+	pthread_cond_signal(&audio_cond);
+	pthread_mutex_unlock(&audio_mutex);
+	fprintf(stderr, "audio[%ld]: retrying '%s' (%s)\n", log_ms(), filepath, reason);
+	return true;
+}
+
+// A failed output is not a failed source. Keep the decoder and its position;
+// the normal pause path rewinds unwritten input and reopens only the PCM on
+// resume. Never replace a newer play, stop or seek with this old write error.
+static void pause_failed_output(void) {
+	pthread_mutex_lock(&audio_mutex);
+	if (!play_request && !stop_thread && !seek_request && audio_command != AUDIO_CMD_STOP) {
+		audio_command = AUDIO_CMD_PAUSE;
+		playback_status = AUDIO_STATUS_PAUSED;
+	}
+	pthread_mutex_unlock(&audio_mutex);
+}
+
+// A route reload may fail before reaching the normal pause loop. Its decoder
+// is already closed, so reuse the cold-resume state instead of restarting at
+// zero on the next Play. Newer commands keep ownership of their request.
+static void retain_failed_output(const char *filepath) {
+	pcm_device_open = false;
+	pthread_mutex_lock(&audio_mutex);
+	if (!play_request && !stop_thread && audio_command != AUDIO_CMD_STOP &&
+		strcmp(current_filepath, filepath) == 0) {
+		double position = seek_request ? seek_target_secs : progress_current_secs;
+		restart_fresh_pending = true;
+		snprintf(restart_fresh_path, sizeof(restart_fresh_path), "%s", filepath);
+		restart_fresh_pos = position > 0 ? position : 0;
+		progress_current_secs = restart_fresh_pos;
+		seek_request = false;
+		seek_target_secs = -1.0;
+		audio_command = AUDIO_CMD_STOP;
+		playback_status = AUDIO_STATUS_PAUSED;
+		track_completed = false;
+	}
+	pthread_mutex_unlock(&audio_mutex);
+}
+
+// ---------------------------------------------------------------------------
+// Rebuffering
+//
+// Only tracks that are played while still downloading need this. The rule is
+// the usual one for anything playing off a network: play while there is enough
+// ahead, and when too little is left, stop and wait until there is plenty
+// again. The two thresholds differ on purpose -- stop at two seconds, resume
+// at eight -- otherwise the wait would be re-entered on every buffer, which is
+// stuttering by another name.
+// ---------------------------------------------------------------------------
+
+#define REBUFFER_LOW_SECS 2.0	// below this much ahead, stop
+#define REBUFFER_HIGH_SECS 8.0	// and do not resume before this much is back
+#define REBUFFER_MAX_WAIT_MS 60000
+
+// Seconds of music ahead of the play position, or -1 when the file is no
+// longer growing (and there is then nothing to wait for).
+static double growing_headroom_secs(decoder_t *dec, int sample_rate, uint64_t at_frame) {
+	uint64_t reachable = decoder_seekable_limit(dec);
+	if (reachable == 0 || sample_rate <= 0) {
+		return -1.0;
+	}
+	if (reachable <= at_frame) {
+		return 0.0;
+	}
+	return (double)(reachable - at_frame) / (double)sample_rate;
+}
+
+static void rebuffer_if_starved(decoder_t *dec, int sample_rate, uint64_t at_frame) {
+	double head = growing_headroom_secs(dec, sample_rate, at_frame);
+	if (head < 0 || head >= REBUFFER_LOW_SECS) {
+		return;
+	}
+
+	fprintf(stderr, "audio[%ld]: buffer run out (%.1f s ahead): waiting\n", log_ms(), head);
+
+	int waited_ms = 0;
+	while (waited_ms < REBUFFER_MAX_WAIT_MS) {
+		// A new command -- stop, pause, another track -- outranks the wait:
+		// leave at once and let the main loop deal with it.
+		pthread_mutex_lock(&audio_mutex);
+		bool leave = audio_command != AUDIO_CMD_PLAY || play_request || stop_thread || seek_request;
+		pthread_mutex_unlock(&audio_mutex);
+		if (leave) {
+			return;
+		}
+
+		// The download finished (or died): nothing more is coming, carry on
+		// with what is there.
+		if (!decoder_is_growing(dec)) {
+			return;
+		}
+
+		head = growing_headroom_secs(dec, sample_rate, at_frame);
+		if (head < 0 || head >= REBUFFER_HIGH_SECS) {
+			fprintf(stderr, "audio[%ld]: resuming with %.1f s buffered\n", log_ms(), head);
+			return;
+		}
+
+		usleep(100 * 1000);
+		waited_ms += 100;
+	}
+
+	fprintf(stderr, "audio[%ld]: a minute of waiting and the buffer will not fill: carrying on anyway\n", log_ms());
+}
+
+// The safety net for when the estimate above is wrong.
+//
+// The check above works from a ratio (bytes downloaded over total bytes,
+// carried onto frames) and is only an estimate: it can report headroom while
+// the decoder is already reading at the edge of the download, where reads
+// trickle and the card underruns continuously.
+//
+// A short read from a growing file is not an estimate: it is proof that the
+// edge has been reached. So this waits on real bytes: it takes where the
+// download has got to, computes the file's rate (total bytes over total
+// duration, both known), and does not resume before REBUFFER_HIGH_SECS
+// seconds of file are in hand beyond that point.
+static void rebuffer_after_short_read(decoder_t *dec, int sample_rate, uint64_t at_frame) {
+	long done = 0, total = 0;
+	if (!decoder_grow_span(dec, &done, &total) || total <= 0) {
+		return; // not growing (any more): nothing to wait for
+	}
+
+	// The flag can be stale: raised while playing at the edge, followed by a
+	// backwards seek. When there is already enough ahead of the play position
+	// there is no starvation to wait out, and waiting anyway would leave the
+	// music stuck at the seek target with the data already on disk.
+	double head = growing_headroom_secs(dec, sample_rate, at_frame);
+	if (head >= REBUFFER_LOW_SECS) {
+		return;
+	}
+	uint64_t total_frames = decoder_total_pcm_frames(dec);
+	if (total_frames == 0 || sample_rate <= 0) {
+		return;
+	}
+	double total_secs = (double)total_frames / (double)sample_rate;
+	if (total_secs <= 0) {
+		return;
+	}
+	double file_rate = (double)total / total_secs; // file bytes per second of music
+
+	long target = done + (long)(file_rate * REBUFFER_HIGH_SECS);
+	if (target > total) {
+		target = total;
+	}
+
+	fprintf(stderr, "audio[%ld]: reading at the edge of the download (%ld KB): waiting for the buffer\n", log_ms(),
+			done / 1024);
+
+	int waited_ms = 0;
+	while (waited_ms < REBUFFER_MAX_WAIT_MS) {
+		pthread_mutex_lock(&audio_mutex);
+		bool leave = audio_command != AUDIO_CMD_PLAY || play_request || stop_thread || seek_request;
+		pthread_mutex_unlock(&audio_mutex);
+		if (leave) {
+			return; // a command outranks the wait
+		}
+
+		if (!decoder_grow_span(dec, &done, &total)) {
+			fprintf(stderr, "audio[%ld]: the download is finished, resuming\n", log_ms());
+			return;
+		}
+		if (done >= target) {
+			fprintf(stderr, "audio[%ld]: resuming with the buffer full (%ld KB)\n", log_ms(), done / 1024);
+			return;
+		}
+
+		usleep(100 * 1000);
+		waited_ms += 100;
+	}
+	fprintf(stderr, "audio[%ld]: a minute at the edge and it is not growing: carrying on anyway\n", log_ms());
+}
+
+// Play routine for uncompressed WAV files: PCM data is streamed straight from
+// the file, no decode step needed.
+static void play_decoded_file(const char *filepath, decode_format_t format);
+
+// What a seek does to the queued audio.
+//
+// A card: dropped and prepared, so the new position is heard at once.
+//
+// bluealsa: left alone. A drop makes bluealsa release the A2DP transport, and
+// a prepare does not acquire it back -- the writes after it are accepted and
+// the headphones hear nothing, or a transport torn down and set up again
+// under a run of seeks. The queue (under 700 ms) plays out and the new
+// position follows it. `already_dropped`: the stream was dropped anyway (a
+// wait for a download), so it is prepared again as a card would be.
+static void seek_flush(snd_pcm_t *pcm, bool already_dropped) {
+	if (pcm_is_bluetooth(pcm) && !already_dropped) {
+		return;
+	}
+	snd_pcm_drop(pcm);
+	snd_pcm_prepare(pcm);
+}
+
+// Only input that reached the sink advances bytes_played. After an interrupted
+// or short write the file may already be one decoded block ahead of that point.
+static bool rewind_wav_input(FILE *file, int64_t data_offset, int64_t played, int64_t *read_pos) {
+	if (fseeko(file, (off_t)(data_offset + played), SEEK_SET) != 0) {
+		return false;
+	}
+	*read_pos = played;
+	crossfeed_reset();
+	return true;
+}
+
+static void play_wav_file(const char *filepath) {
+	FILE *f = NULL;
+	wav_info_t info;
+	int parsed = parse_wav(filepath, &info, &f);
+	// ADPCM, a-law and the rest: libsndfile reads them, and the decoded path
+	// plays what it hands over.
+	if (parsed == WAV_UNSUPPORTED && sndfile_available()) {
+		play_decoded_file(filepath, DECODE_FORMAT_SNDFILE);
+		return;
+	}
+	if (parsed != WAV_OK) {
+		fprintf(stderr, "Audio: Failed to parse WAV metadata: %s\n", filepath);
+		pthread_mutex_lock(&audio_mutex);
+		audio_command = AUDIO_CMD_STOP;
+		playback_status = AUDIO_STATUS_STOPPED;
+		pthread_mutex_unlock(&audio_mutex);
+		return;
+	}
+
+	// Progress, seeks and pauses count bytes of the file, not of what reaches the device.
+	double bytes_per_sec = (double)info.sample_rate * info.src_frame_bytes;
+	int src_frame_bytes = info.src_frame_bytes;
+	pthread_mutex_lock(&audio_mutex);
+	progress_total_secs = (double)info.data_size / bytes_per_sec;
+	progress_current_secs = opening_position();
+	progress_floor_secs = -1.0;
+	stream_sample_rate = info.sample_rate;
+	stream_device_rate = info.sample_rate;
+	stream_channels = info.channels;
+	stream_bits = info.bits_per_sample;
+	stream_dsd_multiple = 0;
+	stream_lossy = false;
+	stream_bitrate_kbps = (int)(bytes_per_sec * 8.0 / 1000.0 + 0.5);
+	stream_codec[0] = '\0'; // no decoder name: the page names it by the extension
+	// See the decoder path: a restore already has PAUSE queued, so it must
+	// not flash through PLAYING on its way to paused.
+	playback_status = (audio_command == AUDIO_CMD_PAUSE) ? AUDIO_STATUS_PAUSED : AUDIO_STATUS_PLAYING;
+	pthread_mutex_unlock(&audio_mutex);
+
+	// The previous track's PCM when it stayed open and suits this one, as on
+	// the decoded path.
+	snd_pcm_uframes_t period_size;
+	snd_pcm_t *pcm_handle = gapless_take(info.channels, info.sample_rate, info.out_bits, &period_size);
+	playback_follow(pcm_handle);
+	if (pcm_handle) {
+		pcm_device_open = true;
+	} else {
+		pcm_handle = open_pcm_device(info.channels, info.sample_rate, info.out_bits, &period_size, NULL);
+	}
+	if (!pcm_handle) {
+		fclose(f);
+		retain_failed_output(filepath);
+		return;
+	}
+	track_started();
+
+	// From here, how long this track takes to start coming out is timed.
+	bt_start_probe_arm(pcm_handle);
+	health_t health;
+	health_start(&health);
+
+	int frame_bytes = info.channels * (info.out_bits / 8);
+	uint64_t paused_at_ms = 0; // monotonic pause anchor, including on MIPS o32
+	char *buffer = malloc(period_size * frame_bytes);
+	// What is read from the file, when it is not already what the device takes.
+	unsigned char *raw = NULL;
+	if (buffer && wav_needs_conversion(&info)) {
+		raw = malloc(period_size * (size_t)src_frame_bytes);
+		if (!raw) {
+			free(buffer);
+			buffer = NULL;
+		}
+	}
+	if (!buffer) {
+		fprintf(stderr, "Audio: Out of memory for period buffer\n");
+		snd_pcm_close(pcm_handle);
+		fclose(f);
+		pthread_mutex_lock(&audio_mutex);
+		audio_command = AUDIO_CMD_STOP;
+		playback_status = AUDIO_STATUS_STOPPED;
+		pthread_mutex_unlock(&audio_mutex);
+		return;
+	}
+
+	// int64_t and not long: on the device (MIPS o32) long is 32 bit, and this
+	// counts PCM bytes. At 44.1 kHz 16-bit stereo that is 176,400 bytes a
+	// second, so a 32-bit sign flips after three and three quarter hours --
+	// the middle of a long audiobook, not an edge case. A negative count makes
+	// progress_current_secs negative and also decides whether a track finished
+	// or was cut short (cut_short, below), so the queue would advance on its
+	// own mid-book.
+	int64_t bytes_played = 0;
+	int64_t read_pos = 0; // bytes of the data chunk already read, ahead of bytes_played by what is queued
+	bool input_needs_rewind = false;
+	bool is_paused = false;
+	bool played_to_the_end = false;
+	int route_check = 0;
+	int track_route = alsa_output_key(); // the output auto_set_output just applied
+
+	while (1) {
+		loop_turns++;
+		pthread_mutex_lock(&audio_mutex);
+		if (audio_command == AUDIO_CMD_STOP || play_request || stop_thread) {
+			pthread_mutex_unlock(&audio_mutex);
+			break;
+		}
+		if (seek_request) {
+			double target = seek_target_secs;
+			seek_request = false;
+			pthread_mutex_unlock(&audio_mutex);
+
+			int64_t target_byte_pos = (int64_t)(target * bytes_per_sec);
+			target_byte_pos = (target_byte_pos / src_frame_bytes) * src_frame_bytes;
+			if (target_byte_pos < 0)
+				target_byte_pos = 0;
+			if (target_byte_pos > info.data_size)
+				target_byte_pos = info.data_size;
+
+			fseeko(f, (off_t)(info.data_offset + target_byte_pos), SEEK_SET);
+			read_pos = target_byte_pos;
+			input_needs_rewind = false; // the explicit seek supersedes discarded input
+
+			// The device may have been handed back during a long pause (see the
+			// PAUSE branch below), and then there is no stream to flush. It has
+			// to be checked: alsa answers a null handle with an assert, which
+			// aborts -- the crash handler parks the audio thread and the player
+			// goes silent until it is restarted, with the interface still
+			// running as if nothing had happened.
+			//
+			// Nothing else needs doing when the device is gone. The file is
+			// already at the new position, the track stays paused, and the
+			// unpause opens a fresh stream from there.
+			if (pcm_handle) {
+				seek_flush(pcm_handle, false);
+				is_paused = false;
+				bt_seek_probe_arm(pcm_handle);
+			}
+
+			bytes_played = target_byte_pos;
+			pthread_mutex_lock(&audio_mutex);
+			progress_current_secs = (double)bytes_played / bytes_per_sec;
+			pthread_mutex_unlock(&audio_mutex);
+			continue;
+		}
+		if (audio_command == AUDIO_CMD_PAUSE) {
+			bool entering = !is_paused;
+			if (entering) {
+				is_paused = true;
+				playback_status = AUDIO_STATUS_PAUSED;
+			}
+			pthread_mutex_unlock(&audio_mutex);
+
+			if (entering) {
+				int64_t rewind_bytes = pause_stop_stream(pcm_handle, src_frame_bytes);
+				if (rewind_bytes > 0 || input_needs_rewind) {
+					// What was still in the buffer was never heard: wind the
+					// file back over it so resuming picks up where the sound
+					// actually stopped.
+					int64_t resume_bytes = bytes_played - rewind_bytes;
+					if (resume_bytes < 0) {
+						resume_bytes = 0;
+					}
+					if (rewind_wav_input(f, info.data_offset, resume_bytes, &read_pos)) {
+						bytes_played = resume_bytes;
+						pthread_mutex_lock(&audio_mutex);
+						progress_floor_secs = progress_current_secs; // the bar stays put
+						progress_current_secs = (double)bytes_played / bytes_per_sec;
+						pthread_mutex_unlock(&audio_mutex);
+					} else {
+						fprintf(stderr, "Audio: WAV input cannot rewind after pause; continuing without rewind\n");
+					}
+					input_needs_rewind = false;
+				}
+			}
+
+			// Straight out of a system suspend the device is left SUSPENDED
+			// underneath a paused track: put it back on its feet now, rather
+			// than letting the next thing that touches it find it that way.
+			pthread_mutex_lock(&audio_mutex);
+			bool recover = resume_recover_pending;
+			resume_recover_pending = false;
+			pthread_mutex_unlock(&audio_mutex);
+			if (recover && pcm_handle) {
+				pcm_restart_after_pause(pcm_handle);
+			}
+
+			// Paused long enough: give the device back so the DAC and the amp
+			// can power down. The file stays open and the position stays
+			// where it is; the unpause below opens a fresh stream.
+			if (entering) {
+				paused_at_ms = paused_clock_ms();
+			}
+			paused_release_due(&pcm_handle, paused_at_ms);
+			paused_wait(pcm_handle != NULL, paused_at_ms);
+			continue;
+		} else {
+			// RESUME is a one-shot command: consumed here, back to
+			// AUDIO_CMD_PLAY. A command left at RESUME poisons every "is a
+			// command pending?" test (audio_command != AUDIO_CMD_PLAY) -- the
+			// growfile waits would give up immediately, the wait for room in
+			// the card's buffer would return -EINTR and throw away a block of
+			// samples per pass, and the "retry after rebuffering" path at the
+			// end of a track would loop without ever declaring the end.
+			if (audio_command == AUDIO_CMD_RESUME) {
+				audio_command = AUDIO_CMD_PLAY;
+			}
+			if (is_paused) {
+				// An unpause always reopens the device from scratch, even after
+				// a one-second pause. Reusing the stopped stream (dropped at
+				// the pause, prepared now) leaves this driver in a bad state:
+				// the audio restarts stuttering, and the real-time audio thread
+				// on a single core never yields the CPU, so the interface
+				// stutters with it. The open-then-write path is the one every
+				// track start, prev and next takes. The cost is a few
+				// milliseconds of open, inaudible under a finger that has just
+				// pressed play.
+				{
+					snd_pcm_uframes_t new_period = period_size;
+					if (!reopen_paused_pcm(&pcm_handle, info.channels, info.sample_rate, info.out_bits, &new_period, false)) {
+						pthread_mutex_unlock(&audio_mutex);
+						continue;
+					}
+					if (new_period > period_size) {
+						char *bigger = realloc(buffer, new_period * frame_bytes);
+						if (bigger) {
+							buffer = bigger;
+						}
+						if (bigger && raw) {
+							unsigned char *more = realloc(raw, new_period * (size_t)src_frame_bytes);
+							if (more) {
+								raw = more;
+							} else {
+								bigger = NULL;
+							}
+						}
+						if (!bigger) {
+							snd_pcm_close(pcm_handle);
+							pcm_handle = NULL;
+							pcm_device_open = false;
+							playback_follow(NULL);
+							audio_command = AUDIO_CMD_STOP;
+							playback_status = AUDIO_STATUS_STOPPED;
+							pthread_mutex_unlock(&audio_mutex);
+							break;
+						}
+						buffer = bigger;
+					}
+					period_size = new_period;
+					fprintf(stderr, "audio[%ld]: device taken back for the unpause\n", log_ms());
+					// A reopen is a fresh start for the sink as much as a new
+					// track is, and the clock has to start again with it: left
+					// armed from the track, the probe would charge the whole
+					// pause to the restart.
+					bt_start_probe_arm(pcm_handle);
+				}
+				is_paused = false;
+				playback_status = AUDIO_STATUS_PLAYING;
+			}
+		}
+		pthread_mutex_unlock(&audio_mutex);
+
+		// Every ~32 buffers: has the jack changed?
+		if (++route_check >= 32) {
+			route_check = 0;
+			int now_route = alsa_output_key();
+			if (now_route != track_route) {
+				track_route = now_route;
+				if (!pcm_reroute(&pcm_handle, info.channels, info.sample_rate, info.out_bits,
+								 &period_size)) {
+					fprintf(stderr, "Audio: reroute failed\n");
+					pthread_mutex_lock(&audio_mutex);
+					audio_command = AUDIO_CMD_STOP;
+					playback_status = AUDIO_STATUS_STOPPED;
+					pthread_mutex_unlock(&audio_mutex);
+					break;
+				}
+			}
+		}
+
+		// A quick pause/resume can replace PAUSE before its branch runs. Also
+		// retain the unwritten tail of a short write, including a Bluetooth one.
+		if (input_needs_rewind) {
+			if (!rewind_wav_input(f, info.data_offset, bytes_played, &read_pos)) {
+				fprintf(stderr, "Audio: WAV input cannot restore an unwritten block; continuing without rewind\n");
+			}
+			input_needs_rewind = false;
+		}
+		playback_follow(pcm_handle);
+		// Up to the end of the data chunk and no further: what follows it is
+		// metadata, not audio.
+		health_mark(&health);
+		int64_t left = info.data_size - read_pos;
+		size_t want = period_size * (size_t)src_frame_bytes;
+		if ((int64_t)want > left) {
+			want = left > 0 ? (size_t)left : 0;
+		}
+		size_t read_bytes = want ? fread(raw ? (void *)raw : (void *)buffer, 1, want, f) : 0;
+		read_bytes -= read_bytes % (size_t)src_frame_bytes;
+		read_pos += (int64_t)read_bytes;
+		int frames_read = (int)(read_bytes / (size_t)src_frame_bytes);
+		if (frames_read > 0) {
+			if (raw) {
+				wav_convert(&info, raw, buffer, (size_t)frames_read);
+			}
+			health_lap(&health, STAGE_READ);
+			if (pure_now()) {
+				// Pass the decoded samples through unchanged.
+			} else if (info.out_bits == 16) {
+				replaygain_process((short *)buffer, frames_read, info.channels);
+				eq_process((short *)buffer, frames_read, info.channels, info.sample_rate);
+				// Soundfield last, on the finished stereo pair -- the stock
+				// module sits at the end of the chain too, taking whatever the
+				// tone shaping left it and widening that.
+				soundfield_process((short *)buffer, frames_read, info.channels);
+				crossfeed_process((short *)buffer, frames_read, info.channels, info.sample_rate);
+				mono_process((short *)buffer, frames_read, info.channels);
+				balance_process((short *)buffer, frames_read, info.channels);
+			} else {
+				replaygain_process_s32((int32_t *)buffer, frames_read, info.channels);
+				eq_process_s32((int32_t *)buffer, frames_read, info.channels, info.sample_rate);
+				soundfield_process_s32((int32_t *)buffer, frames_read, info.channels);
+				crossfeed_process_s32((int32_t *)buffer, frames_read, info.channels, info.sample_rate);
+				mono_process_s32((int32_t *)buffer, frames_read, info.channels);
+				balance_process_s32((int32_t *)buffer, frames_read, info.channels);
+			}
+		}
+		if (frames_read <= 0) {
+			// As in the decoded path: a file that gave nothing has not been
+			// played, and must not be reported as finished.
+			if (bytes_played == 0) {
+				fprintf(stderr, "audio[%ld]: '%s' returned no audio at all\n", log_ms(), filepath);
+				if (retry_track_once(filepath, "nothing read")) {
+					break;
+				}
+				pthread_mutex_lock(&audio_mutex);
+				audio_command = AUDIO_CMD_STOP;
+				playback_status = AUDIO_STATUS_STOPPED;
+				pthread_mutex_unlock(&audio_mutex);
+				break;
+			}
+
+			// Track completed naturally -- unless a stop or another track
+			// arrived while the last read was blocked. That is not an end but
+			// an interrupted read, and calling it "finished" advances the queue
+			// on top of what the user just asked for.
+			//
+			// It happens with tracks played while still downloading:
+			// abandoning the download makes the read in flight return empty.
+			pthread_mutex_lock(&audio_mutex);
+			bool natural_end = audio_command != AUDIO_CMD_STOP && !play_request;
+			audio_command = AUDIO_CMD_STOP;
+			playback_status = AUDIO_STATUS_STOPPED;
+			track_completed = natural_end;
+			pthread_mutex_unlock(&audio_mutex);
+			played_to_the_end = natural_end;
+			if (natural_end && completion_hook) {
+				completion_hook();
+			}
+			break;
+		}
+
+		snd_pcm_uframes_t frames_to_write = (snd_pcm_uframes_t)frames_read;
+		if (fade_enabled && !pure_now()) {
+			int gain = fade_gain_q10((double)bytes_played / bytes_per_sec, (double)info.data_size / bytes_per_sec);
+			int samples = (int)frames_to_write * info.channels;
+			if (info.out_bits == 32) {
+				fade_apply_s32((int32_t *)buffer, samples, gain);
+			} else {
+				fade_apply_s16((short *)buffer, samples, gain);
+			}
+		}
+
+		// The volume, when it is this side of the cable and not in a register:
+		// a device on the USB-C port with no control of its own. A no-op, one
+		// comparison deep, on every other route.
+		if (swvolume_active()) {
+			int samples = (int)frames_to_write * info.channels;
+			if (info.out_bits == 16) {
+				swvolume_apply_s16((short *)buffer, samples);
+			} else {
+				swvolume_apply_s32((int32_t *)buffer, samples);
+			}
+		}
+
+		health_lap(&health, STAGE_EFFECTS);
+		snd_pcm_sframes_t written = pcm_write_recover(&pcm_handle, buffer, frames_to_write, info.channels,
+													  info.sample_rate, info.out_bits, &period_size);
+		health_lap(&health, STAGE_WRITE);
+
+		if (written == -EINTR) {
+			input_needs_rewind = true;
+			continue; // a command is pending: the top of the loop handles it
+		}
+		if (written < 0 || !pcm_handle) {
+			fprintf(stderr, "Audio: Write failed beyond recovery: %s\n", snd_strerror((int)written));
+			input_needs_rewind = true;
+			pause_failed_output();
+			continue;
+		}
+
+		bt_seek_probe_report(pcm_handle);
+		bt_start_probe_note(pcm_handle, written, info.sample_rate);
+
+		bytes_played += (int64_t)written * src_frame_bytes;
+		input_needs_rewind = (snd_pcm_uframes_t)written < frames_to_write;
+		health_tick(&health, info.sample_rate, info.sample_rate, info.bits_per_sample);
+		host_pace(written, info.sample_rate);
+		pthread_mutex_lock(&audio_mutex);
+		report_position((double)bytes_played / bytes_per_sec);
+		pthread_mutex_unlock(&audio_mutex);
+	}
+
+	pthread_mutex_lock(&audio_mutex);
+	mark_stopped_unless_replaced();
+	pthread_mutex_unlock(&audio_mutex);
+
+	// Gapless, on the same conditions as the decoded path.
+	bool keep_open = pcm_handle && gapless_enabled && played_to_the_end && !is_paused &&
+					 (!pcm_is_bluetooth(pcm_handle) || bt_hold_usable(pcm_handle));
+	if (keep_open) {
+		gapless_hold(pcm_handle, info.channels, info.sample_rate, info.out_bits, period_size);
+		pcm_handle = NULL;
+	}
+
+	// Leaving a track while the device is paused must not drain: snd_pcm_drain()
+	// waits for a buffer that a paused device never empties, and the playback
+	// thread would never come back for the next track.
+	//
+	// So the stream is drained only when the track really did reach its end;
+	// every other exit is a switch to something else, and the tail of the old
+	// track is not wanted.
+	if (pcm_handle) {
+		// Nothing to un-pause: a paused stream was dropped when the pause
+		// began, so it is already stopped and safe to close.
+		if (played_to_the_end) {
+			// A track shorter than the buffer may never have reached the start
+			// threshold: the stream is still PREPARED with the whole track
+			// queued. Start it by hand, or the drain has nothing to flush and
+			// those last moments are never heard.
+			if (snd_pcm_state(pcm_handle) == SND_PCM_STATE_PREPARED) {
+				snd_pcm_start(pcm_handle);
+			}
+			pcm_drain_bounded(pcm_handle);
+		} else {
+			snd_pcm_drop(pcm_handle);
+			}
+		snd_pcm_close(pcm_handle);
+	}
+	pcm_device_open = keep_open;
+	free(buffer);
+	free(raw);
+	fclose(f);
+}
+
+// Play routine for compressed formats (MP3/FLAC/OGG Vorbis) via the decoder
+// abstraction in decode.h. Always decodes to interleaved signed 16-bit PCM.
+// How much a track is decimated before the effects chain: over Bluetooth, when
+// the sink runs at a fraction of the track's rate, the chain and alsa's plug
+// then work at the sink's rate. S32 stereo or mono only; 1 means untouched.
+//
+//   [bluetooth]
+//   decimate = 0    leave the whole conversion to the plug
+//
+// A turn of a decimated track, in the track's frames. The decoding and the
+// filtering of four input frames per output frame happen at real-time priority
+// on the one core, so the turn is held to DECIMATED_TURN_MS of audio: the
+// interface waits for a whole turn, and at 90 ms a turn it misses frames. The
+// writes are non-blocking and paced by the PCM's avail_min, so shorter turns
+// only mean more of them.
+#define DECIMATED_TURN_MS 24
+
+static snd_pcm_uframes_t decimated_chunk(snd_pcm_uframes_t period, int out_rate, int decim) {
+	snd_pcm_uframes_t chunk = chunk_for(period, out_rate);
+	if (decim > 1) {
+		snd_pcm_uframes_t cap = (snd_pcm_uframes_t)((long)out_rate * DECIMATED_TURN_MS / 1000);
+		if (cap > 0 && chunk > cap) {
+			chunk = cap;
+		}
+	}
+	return chunk * (snd_pcm_uframes_t)decim;
+}
+
+static int bt_resample_link(int channels);
+
+static int bluetooth_decimation(int sample_rate, int channels, int out_bits, bool passthrough) {
+#ifdef HOST_BUILD
+	// The emulator's stand-in link (see bt_resample_link) decimates like a
+	// real one.
+	if (!passthrough && out_bits == 32 && getenv("SONIX_TEST_RESAMPLE")) {
+		return decimate_factor_for(sample_rate, bt_resample_link(channels));
+	}
+#endif
+	if (passthrough || out_bits != 32 || channels < 1 || channels > DECIMATE_CHANNELS_MAX || !output_is_bluetooth()) {
+		return 1;
+	}
+	if (!config_get_int("bluetooth", "decimate", 1) || config_get_int("bluetooth", "follow_track_rate", 0)) {
+		return 1;
+	}
+	unsigned sink_rate = bluetooth_sink_rate();
+	return sink_rate ? decimate_factor_for(sample_rate, (int)sink_rate) : 1;
+}
+
+// ---------------------------------------------------------------------------
+// The stream to the link's rate, when alsa would do it linearly
+//
+// The player keeps a Bluetooth link at one rate (see open_bluetooth_at_rate),
+// and a stream at another rate was converted by the plug in front of
+// bluealsa's PCM -- whose only converter on this firmware is alsa-lib's linear
+// interpolator. Measured, 44.1 to 48 kHz: the music loses 1.5 dB at 10 kHz,
+// 3.4 at 15 and 6.3 at 20, and its images come back into the audible band
+// 20 dB under a 10 kHz tone (a cymbal at 10 kHz leaves a ghost at 13.9).
+// Upsampling to 96 kHz droops the same way, and so does 48 to 44.1.
+//
+// So the conversions between the two families, and the doubling to a link at
+// twice a base rate, are done here instead, after the effects:
+//
+//   44.1 -> 48 kHz   "Auto", the default: bluealsa runs nearly every pair of
+//                    headphones at 48 kHz, and most music is 44.1.
+//   48 -> 44.1 kHz   "44.1 kHz": the link forced to CD rate, and a 48, 96 or
+//                    192 kHz track -- the last two halved first by the
+//                    decimator, so it is 48 kHz that reaches this.
+//                    Both are the polyphase filters of resample.h.
+//   x2               LDAC on "96 kHz": a 48 kHz stream, or a 44.1 kHz one
+//                    after the step above (and 88.2 kHz the same way from
+//                    44.1). The half-band of decimate.h, run as an
+//                    interpolator.
+//
+// "The stream" is what reaches the device: a hi-res track (and DSD) is first
+// brought down by the decimator, and a 88.2 or 96 kHz stream whose link is of
+// the other family is halved once more, to the base rate the filters start
+// from. The device is opened at the link's rate in S32, so the plug has
+// nothing left to convert but the sample format (S32 to S16 for SBC and AAC,
+// which bluealsa takes at 16 bits; LDAC takes S32 as it is). About 3 million
+// multiply-adds a second in stereo for 44.1 -> 48, 4.2 million for 48 ->
+// 44.1, 1.2 million for the doubling.
+//
+//   [bluetooth]
+//   resampler = quality   this (the default)
+//             = fast      leave it to alsa's linear converter, as before 1.2.4
+//
+// The position, the fade and every byte count stay in the track's frames, as
+// with the decimator; only what goes into the write is at the link's rate.
+// ---------------------------------------------------------------------------
+
+typedef struct {
+	bool on;
+	bool poly;	// between 44.1 and 48 kHz
+	bool twice; // then x2
+	resampler_t filter;
+	interp2_t doubler;
+	int32_t *wide; // a 16-bit block widened to S32
+	int32_t *out;  // the block after the polyphase step
+	int32_t *out2; // ... and at twice that
+	size_t room;   // input frames the buffers are sized for
+} bt_resample_t;
+
+// A base rate, and its double.
+static bool rate_is_base(int rate) { return rate == 44100 || rate == 48000; }
+static bool rate_is_double(int rate) { return rate == 2 * 44100 || rate == 2 * 48000; }
+
+// Whether a stream at `rate` can be brought to `target` here: through one of
+// the polyphase filters, the doubling, or both in that order.
+static bool rate_convertible(int rate, int target) {
+	if (rate == target || !rate_is_base(rate)) {
+		return false;
+	}
+	int base = rate_is_double(target) ? target / 2 : target;
+	return rate_is_base(base) && (base == rate || resample_supported(rate, base));
+}
+
+// The rate the Bluetooth link is held at when a stream may be converted to it
+// here; 0 when there is no link, the plug is asked to do it ("fast"), or
+// bluealsa's plugin moves the link itself ("follow_track_rate").
+static int bt_resample_link(int channels) {
+	if (channels < 1 || channels > RESAMPLE_CHANNELS_MAX || !resample_quality_wanted()) {
+		return 0;
+	}
+#ifdef HOST_BUILD
+	// The emulator has no Bluetooth. SONIX_TEST_RESAMPLE=48000, 44100, 88200
+	// or 96000 runs this path into its null device as if the link were at that
+	// rate, so the loop around it can be watched there.
+	const char *test = getenv("SONIX_TEST_RESAMPLE");
+	if (test) {
+		int want = atoi(test);
+		return (want == 44100 || rate_is_double(want)) ? want : 48000;
+	}
+#endif
+	if (output_is_bluetooth() && !config_get_int("bluetooth", "follow_track_rate", 0)) {
+		return (int)bluetooth_sink_rate();
+	}
+	return 0;
+}
+
+// The link's rate when the `rate` stream should be converted to it here; 0 to
+// leave the stream as it is.
+static int bt_resample_target(int rate, int channels) {
+	int link = bt_resample_link(channels);
+	return link && rate_convertible(rate, link) ? link : 0;
+}
+
+// ---------------------------------------------------------------------------
+// A USB DAC that lacks the track's rate
+//
+// A USB DAC is opened through plughw, and the plug answers a rate the DAC
+// does not have by converting to one it does -- linearly, the same converter
+// as above. Plenty of USB-C dongles run at 48 kHz only, so on those every CD
+// rip, every Yandex track, AirPlay and the radio went through it.
+//
+// So the DAC is asked which rates it really has: its hw device is opened for
+// a moment (no stream, no buffer: snd-usb-audio allocates nothing before
+// hw_params) and every common rate is tested against it, together with
+// whether it takes more than 16 bits. The answer is kept per device name and
+// card, and reused when the device is busy -- a held gapless stream, or the
+// open stream of an external source. When the track's rate is missing, the
+// player converts it itself, to:
+//
+//   1. the highest rate of the same family below it, by the decimator alone
+//      (a 192 kHz track on a DAC that stops at 96); else twice it, by the
+//      half-band doubling (44.1 on a DAC that only has 88.2 and up);
+//   2. else the other family's base rate (44.1 <-> 48 kHz) by the polyphase
+//      filter, after the decimator for a hi-res track; else twice that.
+//
+// The lowest rate that carries the track whole is preferred over a higher
+// one: a doubling adds nothing to the music and costs time. A rate none of
+// that reaches (22.05 kHz, 32 kHz ...) is left to the plug, as before, and
+// the log says so. Under [bluetooth] resampler like the rest: "fast" leaves
+// every conversion to the plug.
+// ---------------------------------------------------------------------------
+
+static const int USB_PROBE_RATES[] = {44100, 48000, 88200, 96000, 176400, 192000, 352800, 384000, 705600, 768000};
+#define USB_PROBE_COUNT ((int)(sizeof(USB_PROBE_RATES) / sizeof(USB_PROBE_RATES[0])))
+
+typedef struct {
+	char device[sizeof(output_pcm)]; // "" when nothing was probed
+	char card[64];					 // the card's name, so a different DAC on the same number is noticed
+	unsigned rates;					 // a bit per USB_PROBE_RATES entry
+	bool wide;						 // takes 24 or 32-bit samples
+} usb_caps_t;
+
+static usb_caps_t usb_caps;
+static pthread_mutex_t usb_caps_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static bool output_is_usb_card(const char *device) {
+	return strncmp(device, "plughw:", 7) == 0 || strncmp(device, "hw:", 3) == 0;
+}
+
+static void usb_rates_text(unsigned rates, char *out, size_t size) {
+	out[0] = '\0';
+	size_t used = 0;
+	for (int i = 0; i < USB_PROBE_COUNT && used < size; i++) {
+		if (rates & (1u << i)) {
+			int n = snprintf(out + used, size - used, "%s%d", used ? ", " : "", USB_PROBE_RATES[i]);
+			used += n > 0 ? (size_t)n : 0;
+		}
+	}
+}
+
+// What the DAC behind `device` takes. False when it cannot be told: not a USB
+// card, or busy and never probed.
+static bool usb_caps_for(const char *device, usb_caps_t *out) {
+#ifdef HOST_BUILD
+	// The emulator has no USB DAC. SONIX_TEST_USB_RATES=48000,96000 makes its
+	// null device answer as a DAC with those rates, SONIX_TEST_USB_BITS=16 as
+	// one that takes 16 bits only.
+	const char *test = getenv("SONIX_TEST_USB_RATES");
+	if (test) {
+		memset(out, 0, sizeof(*out));
+		snprintf(out->device, sizeof(out->device), "%s", device);
+		for (int i = 0; i < USB_PROBE_COUNT; i++) {
+			char key[16];
+			snprintf(key, sizeof(key), "%d", USB_PROBE_RATES[i]);
+			if (strstr(test, key)) {
+				out->rates |= 1u << i;
+			}
+		}
+		const char *bits = getenv("SONIX_TEST_USB_BITS");
+		out->wide = !bits || atoi(bits) > 16;
+		return true;
+	}
+#endif
+	if (!output_is_usb_card(device)) {
+		return false;
+	}
+	char card[64] = "";
+	usbaudio_card_name(card, sizeof(card));
+
+	// The hw device under the plug: "plughw:1,0" is "hw:1,0".
+	char hw[sizeof(output_pcm)];
+	snprintf(hw, sizeof(hw), "%s", strncmp(device, "plug", 4) == 0 ? device + 4 : device);
+
+	snd_pcm_t *pcm = NULL;
+	int err = snd_pcm_open(&pcm, hw, SND_PCM_STREAM_PLAYBACK, SND_PCM_NONBLOCK);
+	if (err < 0) {
+		pthread_mutex_lock(&usb_caps_lock);
+		bool cached = strcmp(usb_caps.device, device) == 0 && strcmp(usb_caps.card, card) == 0;
+		if (cached) {
+			*out = usb_caps;
+		}
+		pthread_mutex_unlock(&usb_caps_lock);
+		if (!cached) {
+			fprintf(stderr, "audio: the USB DAC's rates cannot be read (%s: %s)\n", hw, snd_strerror(err));
+		}
+		return cached;
+	}
+
+	usb_caps_t caps;
+	memset(&caps, 0, sizeof(caps));
+	snprintf(caps.device, sizeof(caps.device), "%s", device);
+	snprintf(caps.card, sizeof(caps.card), "%s", card);
+	snd_pcm_hw_params_t *hw_params;
+	snd_pcm_hw_params_alloca(&hw_params);
+	if (snd_pcm_hw_params_any(pcm, hw_params) >= 0) {
+		for (int i = 0; i < USB_PROBE_COUNT; i++) {
+			if (snd_pcm_hw_params_test_rate(pcm, hw_params, (unsigned)USB_PROBE_RATES[i], 0) == 0) {
+				caps.rates |= 1u << i;
+			}
+		}
+		caps.wide = snd_pcm_hw_params_test_format(pcm, hw_params, SND_PCM_FORMAT_S32_LE) == 0 ||
+					snd_pcm_hw_params_test_format(pcm, hw_params, SND_PCM_FORMAT_S24_LE) == 0 ||
+					snd_pcm_hw_params_test_format(pcm, hw_params, SND_PCM_FORMAT_S24_3LE) == 0;
+	}
+	snd_pcm_close(pcm);
+
+	pthread_mutex_lock(&usb_caps_lock);
+	bool changed = strcmp(usb_caps.device, caps.device) != 0 || strcmp(usb_caps.card, caps.card) != 0 ||
+				   usb_caps.rates != caps.rates || usb_caps.wide != caps.wide;
+	usb_caps = caps;
+	pthread_mutex_unlock(&usb_caps_lock);
+	if (changed) {
+		char text[160];
+		usb_rates_text(caps.rates, text, sizeof(text));
+		fprintf(stderr, "audio: the USB DAC '%s' (%s) takes %s Hz, %s\n", card, hw, text[0] ? text : "no common rate",
+				caps.wide ? "24/32-bit samples" : "16-bit samples only");
+	}
+	*out = caps;
+	return true;
+}
+
+static bool usb_caps_has(const usb_caps_t *caps, int rate) {
+	for (int i = 0; i < USB_PROBE_COUNT; i++) {
+		if (USB_PROBE_RATES[i] == rate) {
+			return (caps->rates & (1u << i)) != 0;
+		}
+	}
+	return false;
+}
+
+// The rate a stream at `rate` should reach the USB DAC at, when the DAC lacks
+// it and the player can convert to one it has (see above); 0 otherwise.
+// `*halvings` is how many times the decimator halves the stream first.
+static int usb_rate_plan(int rate, int channels, int *halvings) {
+	*halvings = 0;
+	if (channels < 1 || channels > RESAMPLE_CHANNELS_MAX || !resample_quality_wanted()) {
+		return 0;
+	}
+	char device[sizeof(output_pcm)];
+	audio_get_output_device(device, sizeof(device));
+	usb_caps_t caps;
+	if (!usb_caps_for(device, &caps) || caps.rates == 0 || usb_caps_has(&caps, rate)) {
+		return 0;
+	}
+
+	int target = 0;
+	int halve = 0;
+	// 1. The same family: down by the decimator, or x2.
+	for (int k = 1; k <= 3 && !target; k++) {
+		int r = rate >> k;
+		if (rate % (1 << k) != 0 || r < 44100) {
+			break;
+		}
+		if (usb_caps_has(&caps, r)) {
+			target = r;
+			halve = k;
+		}
+	}
+	if (!target && rate_is_base(rate) && usb_caps_has(&caps, 2 * rate)) {
+		target = 2 * rate;
+	}
+	// 2. The other family, from the base rate.
+	if (!target) {
+		int k = 0;
+		while (k < 3 && !rate_is_base(rate >> k) && rate % (2 << k) == 0) {
+			k++;
+		}
+		int base = rate >> k;
+		if (rate_is_base(base)) {
+			int other = base == 44100 ? 48000 : 44100;
+			if (usb_caps_has(&caps, other)) {
+				target = other;
+				halve = k;
+			} else if (usb_caps_has(&caps, 2 * other)) {
+				target = 2 * other;
+				halve = k;
+			}
+		}
+	}
+
+	char text[160];
+	usb_rates_text(caps.rates, text, sizeof(text));
+	if (!target) {
+		fprintf(stderr, "audio: the USB DAC has no %d Hz (it takes %s) and none it has is reached from it here; alsa converts\n",
+				rate, text);
+		return 0;
+	}
+	fprintf(stderr, "audio: the USB DAC has no %d Hz (it takes %s); the stream is converted to %d Hz here\n", rate, text,
+			target);
+	*halvings = halve;
+	return target;
+}
+
+static bool bt_resample_open(bt_resample_t *r, int rate, int link, int channels) {
+	memset(r, 0, sizeof(*r));
+	r->twice = rate_is_double(link);
+	int base = r->twice ? link / 2 : link;
+	r->poly = base != rate;
+	if (r->poly && resample_init(&r->filter, rate, base, channels) != 0) {
+		return false;
+	}
+	if (r->twice && interp2_init(&r->doubler, channels) != 0) {
+		return false;
+	}
+	r->on = r->poly || r->twice;
+	return r->on;
+}
+
+static void bt_resample_reset(bt_resample_t *r) {
+	if (r->poly) {
+		resample_reset(&r->filter);
+	}
+	if (r->twice) {
+		interp2_reset(&r->doubler);
+	}
+}
+
+// Also gives the polyphase table back: the last stream to let go frees it.
+static void bt_resample_close(bt_resample_t *r) {
+	resample_close(&r->filter);
+	free(r->wide);
+	free(r->out);
+	free(r->out2);
+	memset(r, 0, sizeof(*r));
+}
+
+// Grows `*buffer` to `samples` S32 samples; false when there is no memory.
+static bool grow_s32(int32_t **buffer, size_t samples) {
+	int32_t *bigger = realloc(*buffer, samples * sizeof(int32_t));
+	if (!bigger) {
+		return false;
+	}
+	*buffer = bigger;
+	return true;
+}
+
+// `frames` frames of the chain's output (S16 or S32), converted. The block at
+// the link's rate and its length, or NULL when there was no memory for it.
+static const int32_t *bt_resample_block(bt_resample_t *r, const void *in, int bits, int frames, int channels,
+										int *made) {
+	*made = 0;
+	if ((size_t)frames > r->room) {
+		size_t at_base = (size_t)(r->poly ? resample_out_max(&r->filter, frames) : frames) * (size_t)channels;
+		if (!grow_s32(&r->wide, (size_t)frames * (size_t)channels) || !grow_s32(&r->out, at_base) ||
+			!grow_s32(&r->out2, 2 * at_base)) {
+			return NULL;
+		}
+		r->room = (size_t)frames;
+	}
+	const int32_t *from = in;
+	if (bits == 16) {
+		const short *narrow = in;
+		for (int i = 0; i < frames * channels; i++) {
+			r->wide[i] = (int32_t)narrow[i] * 65536;
+		}
+		from = r->wide;
+	}
+	int count = frames;
+	if (r->poly) {
+		count = resample_s32(&r->filter, from, count, r->out);
+		from = r->out;
+	}
+	if (r->twice) {
+		count = interp2_s32(&r->doubler, from, count, r->out2);
+		from = r->out2;
+	}
+	*made = count;
+	return from;
+}
+
+// Whether the USB DAC in use would not take DSD at `dop_rate` over DoP: it
+// lacks the carrier rate, or takes only 16 bits, which cannot hold a marker
+// byte and sixteen bits of stream. False when the output is not a USB DAC or
+// cannot be asked. Such a DAC gets the track as PCM (dsd_to_pcm), which it
+// can play, instead of a stream it would play as noise or refuse.
+static bool usb_refuses_dop(int dop_rate) {
+	char device[sizeof(output_pcm)];
+	audio_get_output_device(device, sizeof(device));
+	usb_caps_t caps;
+	if (strncmp(device, "bluealsa", 8) == 0 || !usb_caps_for(device, &caps) || caps.rates == 0) {
+		return false;
+	}
+	if (caps.wide && usb_caps_has(&caps, dop_rate)) {
+		return false;
+	}
+	fprintf(stderr, "audio: the USB DAC %s; the DSD track goes to it as PCM\n",
+			caps.wide ? "has no rate for this DoP stream" : "takes 16 bits only, too few for DoP");
+	return true;
+}
+
+// Set when a DoP stream was refused at the open: the same track is opened
+// again at once and converted to PCM. Playback thread only.
+static bool dsd_force_pcm;
+
+// ---------------------------------------------------------------------------
+// 16-bit sources through the 32-bit chain, and the way back to 16 bits
+//
+// A 16-bit track went through the effects at 16 bits: ReplayGain, the EQ, the
+// balance, the fade and the software volume each rounded their result to 16
+// bits and the next started from there, and the last rounding was a plain
+// truncation-to-nearest with no dither -- distortion products at the 16-bit
+// floor that follow the music, worst on quiet passages, the very ones
+// ReplayGain and a low software volume make quieter still.
+//
+// So when, at the start of a track, something is switched on that changes the
+// samples, a 16-bit source runs the same S32 chain a 24-bit one does: decoded
+// at 16 bits (through the time stretcher as before), widened, processed with
+// 24 bits of precision, and handed to the device in S32 -- which the built-in
+// DAC takes as S24_LE, so the result reaches it with nothing rounded away. The
+// same happens to a 16-bit hi-res stream the decimator has to bring down, the
+// decimator being S32 only.
+//
+// Where the output takes 16 bits only -- SBC and AAC over Bluetooth, a USB DAC
+// that has nothing wider -- the S32 stream is requantised here, once, with
+// TPDF dither (two uniform values of one LSB each, summed), rather than
+// truncated by the plug. A block whose samples have nothing below bit 16 --
+// a 16-bit stream nothing changed -- is only narrowed: dither on a signal that
+// needs no requantising would be noise added to a bit-perfect stream.
+//
+// With nothing switched on, a 16-bit track stays on the 16-bit path from end
+// to end, as before: bit-perfect. The decision is made per track; switching
+// an effect on halfway through a 16-bit track takes the 16-bit chain until the
+// next one, as in 1.2.4.
+//
+// Cost: the S32 chain does the work the 16-bit one did on twice the bytes,
+// plus a widening; the dither is a xorshift and an add per sample.
+// ---------------------------------------------------------------------------
+
+// Whether something in the chain is going to change the samples.
+static bool effects_change_samples(void) {
+	return replaygain_active() || eq_get_enabled() || peq_get_enabled() || mseb_get_enabled() ||
+		   (soundfield_get_enabled() && soundfield_get_width() != 100) ||
+		   (balance_get_enabled() && balance_get_value() != BALANCE_CENTRE) || mono_get_enabled() ||
+		   crossfeed_get_enabled() || fade_enabled || swvolume_active();
+}
+
+// Whether the output in use takes more than 16 bits. True when it cannot be
+// told, which is what the player assumed until now: the plug narrows.
+static bool output_takes_wide(void) {
+	char device[sizeof(output_pcm)];
+	audio_get_output_device(device, sizeof(device));
+	if (strncmp(device, "bluealsa", 8) == 0) {
+		// bluealsa takes what the codec encodes from: S16 for SBC, AAC and
+		// aptX, more for LDAC, aptX HD and LC3plus.
+		char codecs[BT_MAX_CODECS][BT_CODEC_MAX];
+		char codec[BT_CODEC_MAX] = "";
+		bluetooth_get_codecs(codecs, BT_MAX_CODECS, codec, sizeof(codec));
+		return !codec[0] || strcasecmp(codec, "LDAC") == 0 || strncasecmp(codec, "aptX-HD", 7) == 0 ||
+			   strncasecmp(codec, "aptX HD", 7) == 0 || strncasecmp(codec, "LC3plus", 7) == 0 ||
+			   strncasecmp(codec, "LHDC", 4) == 0;
+	}
+	usb_caps_t caps;
+	return !usb_caps_for(device, &caps) || caps.wide;
+}
+
+// TPDF dither from S32 to S16, in place: `samples` S32 samples become as many
+// S16 ones at the front of the same memory. `seed` is the generator's state,
+// one per stream.
+static void dither_to_s16(uint32_t *seed, void *buf, int samples) {
+	const int32_t *in = buf;
+	int16_t *out = buf;
+	int32_t low = 0;
+	for (int i = 0; i < samples; i++) {
+		low |= in[i] & 0xffff;
+	}
+	if (low == 0) {
+		for (int i = 0; i < samples; i++) {
+			out[i] = (int16_t)(in[i] >> 16);
+		}
+		return;
+	}
+	uint32_t x = *seed ? *seed : 0x9e3779b9u;
+	for (int i = 0; i < samples; i++) {
+		// xorshift32: two 16-bit uniforms per step.
+		x ^= x << 13;
+		x ^= x >> 17;
+		x ^= x << 5;
+		int64_t tpdf = (int64_t)(x & 0xffff) + (int64_t)(x >> 16) - 65535;
+		int64_t v = ((int64_t)in[i] + tpdf + 32768) >> 16;
+		out[i] = (int16_t)(v > 32767 ? 32767 : v < -32768 ? -32768 : v);
+	}
+	*seed = x;
+}
+
+// One block of 16-bit frames from the decoder, through the time stretcher when
+// there is one. Returns the frames that came out; `*input` is how many went
+// in, which is what the position moves by.
+static uint64_t read_s16_block(speed_t *stretch, decoder_t *dec, decoder_fill_t *fill, short *dst, uint64_t frames,
+							   uint64_t *input) {
+	pthread_mutex_lock(&audio_mutex);
+	double want_speed = playback_speed;
+	pthread_mutex_unlock(&audio_mutex);
+
+	if (stretch) {
+		speed_set_factor(stretch, want_speed);
+		return (uint64_t)speed_pull(stretch, dst, (int)frames, decoder_fill, fill, input);
+	}
+	uint64_t got = decoder_read_pcm_frames_s16(dec, frames, dst);
+	*input = got;
+	return got;
+}
+
+static bool rewind_decoded_input(decoder_t *dec, uint64_t frame, speed_t *stretch, decimator_t *decim,
+								 bt_resample_t *resampler) {
+	if (!decoder_seek_to_frame(dec, frame)) {
+		return false;
+	}
+	// These buffers contain the discarded input's future samples. Keep the
+	// user's EQ/PEQ/MSEB settings: their reset APIs reset controls, not history.
+	speed_reset(stretch);
+	crossfeed_reset();
+	if (decim) {
+		decimate_reset(decim);
+	}
+	bt_resample_reset(resampler);
+	return true;
+}
+
+static void play_decoded_file(const char *filepath, decode_format_t format) {
+	decoder_t *dec = decoder_open(filepath, format);
+	if (!dec) {
+		// A busy card (a cover decoding, the library scanning) can make the
+		// first open fail transiently; one more try costs nothing and saves
+		// the track.
+		usleep(200 * 1000);
+		dec = decoder_open(filepath, format);
+	}
+
+	// A file still downloading is not a broken file: it is not all there yet.
+	//
+	// A streamed track starts playing while it arrives, as soon as the cache
+	// reports enough. Between that report and this open there are a couple of
+	// thread hops, and now and then the decoder arrives a moment too early: the
+	// FLAC header is not complete and decoder_open() refuses.
+	//
+	// So it waits: while the file grows, bytes are arriving and retrying is
+	// worthwhile. The wait gives up on any command (another track, a stop, a
+	// pause), so it blocks nothing.
+	for (int wait = 0; !dec && growfile_is_growing(filepath) && wait < DECODER_GROW_RETRIES; wait++) {
+		pthread_mutex_lock(&audio_mutex);
+		bool leave = audio_command != AUDIO_CMD_PLAY || play_request || stop_thread;
+		pthread_mutex_unlock(&audio_mutex);
+		if (leave) {
+			break;
+		}
+		if (wait == 0) {
+			fprintf(stderr, "audio[%ld]: '%s' is still downloading, waiting instead of giving up\n", log_ms(),
+					filepath);
+		}
+		usleep(DECODER_GROW_RETRY_MS * 1000);
+		dec = decoder_open(filepath, format);
+	}
+
+	if (!dec) {
+		fprintf(stderr, "Audio: Failed to open decoder for: %s\n", filepath);
+		pthread_mutex_lock(&audio_mutex);
+		audio_command = AUDIO_CMD_STOP;
+		playback_status = AUDIO_STATUS_STOPPED;
+		pthread_mutex_unlock(&audio_mutex);
+		return;
+	}
+
+	// Headphones have no DSD mode to switch into: DSD goes to them as PCM.
+	// So does a USB DAC that cannot take this DoP stream, or one that refused it
+	// at the open (dsd_force_pcm).
+	bool force_pcm = dsd_force_pcm;
+	dsd_force_pcm = false;
+	bool dsd_as_pcm = decoder_passthrough(dec) &&
+					  (output_is_bluetooth() || force_pcm || usb_refuses_dop(decoder_sample_rate(dec))) &&
+					  decoder_dsd_to_pcm(dec);
+
+	int channels = decoder_channels(dec);
+	int sample_rate = decoder_sample_rate(dec);
+	uint64_t total_frames = decoder_total_pcm_frames(dec);
+	int source_bits = decoder_source_bits(dec);
+
+	// New track, clean start: the crossfeed delay line still holds half a
+	// millisecond of the previous one, which would be audible over a quiet
+	// opening.
+	crossfeed_reset();
+
+	// DoP: the frames are DSD bits with a marker byte the DAC watches for, not
+	// audio. Nothing in the chain may touch them -- see decoder_passthrough().
+	bool passthrough = decoder_passthrough(dec);
+	int dsd_multiple = decoder_dsd_multiple(dec);
+
+	// Hi-res sources go to the DAC at their real depth: a 24-bit FLAC plays
+	// as S32 (samples left-justified, bit-perfect), the way the stock player
+	// flips its stream to "PCM_FORMAT_PCM 32bit". Everything else stays 16.
+	int out_bits = source_bits > 16 ? 32 : 16;
+	// ...unless the chain is going to change a 16-bit stream: then it runs at
+	// 32 bits (see effects_change_samples). Not for DoP, which is never
+	// touched.
+	bool wide16 = false;
+	if (out_bits == 16 && !passthrough && effects_change_samples()) {
+		wide16 = true;
+		out_bits = 32;
+	}
+
+	// The Bluetooth link's own rate, when the "Sample rate" setting asks for
+	// one ("Follow the music", "96 kHz"; see bluetooth.c). Here and nowhere
+	// else: the track's rate is known and nothing is open on the stream yet,
+	// so moving the link costs a second of silence between two tracks instead
+	// of an open stream torn down under the music. Only when the rate really
+	// changes, so a whole album at one rate asks once. The decimation and the
+	// conversion below are then worked out against the new rate.
+	if (!passthrough && output_is_bluetooth()) {
+		unsigned link_to = bluetooth_link_rate_wanted((unsigned)sample_rate, dsd_as_pcm);
+		if (link_to) {
+			// The held PCM is the previous track's tail on the old transport,
+			// which the change is about to rebuild: played out and closed first.
+			gapless_release();
+			bool moved = bluetooth_link_rate_set(link_to);
+			fprintf(stderr, "audio[%ld]: Bluetooth link %s for the %d Hz track; it runs at %u Hz\n", log_ms(),
+					moved ? "moved" : "not moved", sample_rate, bluetooth_sink_rate());
+		}
+	}
+
+	// The rate the device is opened at. The position, the fade and every
+	// byte count below stay in the track's own frames.
+	decimator_t decim;
+	// A 16-bit stream counts as S32 here: one the decimator takes runs the S32
+	// chain (wide16, below).
+	int decim_factor = bluetooth_decimation(sample_rate, channels, passthrough ? out_bits : 32, passthrough);
+	// 176.4 kHz is more than any Bluetooth link carries, whatever the
+	// decimation settings say.
+	if (dsd_as_pcm && decim_factor == 1 && output_is_bluetooth()) {
+		unsigned sink = bluetooth_sink_rate();
+		decim_factor = decimate_factor_for(sample_rate, sink ? (int)sink : 44100);
+	}
+	// A stream still at 88.2 or 96 kHz whose link is of the other family has
+	// no clean way there: halved once more, it takes the base-rate route below
+	// -- 88.2 kHz to a link at 96 goes to 44.1, then 48, then x2.
+	if (!passthrough && rate_is_double(sample_rate / decim_factor) && decim_factor * 2 <= DECIMATE_MAX) {
+		int link = bt_resample_link(channels);
+		int half = sample_rate / decim_factor / 2;
+		if (link && !rate_convertible(sample_rate / decim_factor, link) && (half == link || rate_convertible(half, link))) {
+			decim_factor *= 2;
+		}
+	}
+	// A USB DAC without the track's rate: the rate it gets instead, and how
+	// often the decimator halves the stream on the way (see usb_rate_plan).
+	int usb_halvings = 0;
+	int usb_target = (passthrough || decim_factor > 1) ? 0 : usb_rate_plan(sample_rate, channels, &usb_halvings);
+	if (usb_target) {
+		decim_factor = 1 << usb_halvings;
+	}
+	if (decim_factor > 1 && decimate_init(&decim, decim_factor, channels) != 0) {
+		decim_factor = 1;
+		usb_target = 0;
+	}
+	// The decimator works on S32 only.
+	if (decim_factor > 1 && out_bits == 16) {
+		wide16 = true;
+		out_bits = 32;
+	}
+	if (wide16) {
+		fprintf(stderr, "audio: the 16-bit stream goes through the 32-bit chain (%s)\n",
+				decim_factor > 1 ? "decimated" : "effects on");
+	}
+	int out_rate = sample_rate / decim_factor;
+	if (decim_factor > 1) {
+		fprintf(stderr, "audio: the %d Hz track is decimated by %d to %d Hz before the effects, for the %s\n",
+				sample_rate, decim_factor, out_rate, usb_target ? "USB DAC" : "headphones");
+	}
+
+	// What the device is opened with: the chain's rate and width, or the
+	// link's (or the USB DAC's) rate in S32 when the stream is converted here
+	// (see bt_resample_t).
+	bt_resample_t resampler = {0};
+	int link_rate = passthrough ? 0 : bt_resample_target(out_rate, channels);
+	if (!link_rate && usb_target && usb_target != out_rate) {
+		link_rate = usb_target;
+	}
+	if (link_rate && !bt_resample_open(&resampler, out_rate, link_rate, channels)) {
+		bt_resample_close(&resampler);
+	}
+	int dev_rate = resampler.on ? link_rate : out_rate;
+	int dev_bits = resampler.on ? 32 : out_bits;
+	// An output that takes 16 bits only gets the S32 stream requantised here,
+	// with dither, instead of truncated by the plug.
+	bool dither = false;
+	uint32_t dither_seed = 0x2545f491u;
+	if (dev_bits == 32 && !passthrough && !output_takes_wide()) {
+		dev_bits = 16;
+		dither = true;
+		fprintf(stderr, "audio: the output takes 16 bits; the 32-bit stream is dithered (TPDF) to 16 here\n");
+	}
+	if (resampler.on) {
+		char how[64];
+		if (resampler.twice && resampler.poly) {
+			snprintf(how, sizeof(how), "polyphase to %d Hz, half-band x2", link_rate / 2);
+		} else {
+			snprintf(how, sizeof(how), "%s", resampler.twice ? "half-band x2" : "polyphase");
+		}
+		fprintf(stderr, "audio: the %d Hz stream is resampled to %d Hz here (%s), not by alsa's linear converter\n",
+				out_rate, dev_rate, how);
+	}
+
+	pthread_mutex_lock(&audio_mutex);
+	progress_total_secs = (double)total_frames / sample_rate;
+	progress_current_secs = opening_position();
+	progress_floor_secs = -1.0;
+	stream_sample_rate = sample_rate;
+	stream_device_rate = dev_rate;
+	stream_channels = channels;
+	stream_bits = source_bits;
+	stream_dsd_multiple = dsd_multiple;
+	stream_bitrate_kbps = decoder_bitrate_kbps(dec);
+	stream_lossy = decoder_is_lossy(dec);
+	snprintf(stream_codec, sizeof(stream_codec), "%s", decoder_codec_name(dec));
+	// A lossy format that does not declare its bitrate: the player can only
+	// print the format name. Worth logging, because on a streaming track there
+	// is no other way to work it out -- the cache file is still growing.
+	if (stream_lossy && stream_bitrate_kbps <= 0) {
+		fprintf(stderr, "audio[%ld]: %s does not declare a bitrate\n", log_ms(), stream_codec);
+	}
+	// A track that is being restored comes up with PAUSE already queued: say
+	// PAUSED right away rather than flashing through PLAYING, which would make
+	// the LED change colour for a moment at every boot and the status bar show
+	// a play glyph for a track that never started.
+	playback_status = (audio_command == AUDIO_CMD_PAUSE) ? AUDIO_STATUS_PAUSED : AUDIO_STATUS_PLAYING;
+	pthread_mutex_unlock(&audio_mutex);
+
+	// The DAC has to be told before the stream starts, or the first periods
+	// reach it while it is still reading the words as PCM -- which at DoP
+	// levels is a bang.
+	if (passthrough) {
+		// Any held PCM goes first: a DAC about to switch to DSD must not still
+		// have the previous track's PCM tail queued.
+		gapless_release();
+		set_dac_dop(1);
+	}
+
+	snd_pcm_uframes_t period_size;
+	// The previous track's PCM, if it stayed open and suits this one too: that
+	// is the whole of gapless. Never for DoP -- see the comment above
+	// gapless_release().
+	pcm_open_error_t open_error = {0};
+	pcm_exact_rate = passthrough;
+	snd_pcm_t *pcm_handle = passthrough ? NULL : gapless_take(channels, dev_rate, dev_bits, &period_size);
+	playback_follow(pcm_handle);
+	if (pcm_handle) {
+		pcm_device_open = true;
+	} else {
+		pcm_handle = open_pcm_device(channels, dev_rate, dev_bits, &period_size, &open_error);
+	}
+	if (!pcm_handle && resampler.on && pcm_setup_fallback_allowed(&open_error)) {
+		// The link refused 48 kHz S32: the stream goes as it did before, and
+		// the plug converts it.
+		fprintf(stderr, "audio: the resampled stream would not open; alsa converts the %d Hz one instead\n", out_rate);
+		bt_resample_close(&resampler);
+		dev_rate = out_rate;
+		dev_bits = out_bits;
+		pcm_handle = open_pcm_device(channels, dev_rate, dev_bits, &period_size, &open_error);
+	}
+	if (!pcm_handle && dev_bits == 32 && !passthrough && open_error.code == -ENOMEM) {
+		// Not the device refusing S32: the driver found no memory even for the
+		// smallest buffer. Another open straight away, in any format, asks the
+		// same exhausted kernel for more.
+		fprintf(stderr, "audio: not retried at 16 bit -- the driver is out of memory, not the format refused\n");
+	} else if (!pcm_handle && dev_bits == 32 && !passthrough && pcm_setup_fallback_allowed(&open_error)) {
+		// If this output cannot do S32 for some reason, 16-bit playback still
+		// beats silence. Not for DoP: sixteen bits cannot carry a marker byte
+		// and a twenty-four bit payload, so half a DoP stream is not quieter
+		// DSD, it is noise.
+		fprintf(stderr, "Audio: S32 open failed, falling back to 16-bit\n");
+		out_bits = 16;
+		wide16 = false;
+		dither = false;
+		// The decimator is S32 only, and so is the resampler.
+		decim_factor = 1;
+		out_rate = sample_rate;
+		bt_resample_close(&resampler);
+		dev_rate = out_rate;
+		dev_bits = out_bits;
+		pcm_handle = open_pcm_device(channels, sample_rate, out_bits, &period_size, &open_error);
+	}
+	pcm_exact_rate = false;
+#ifdef HOST_BUILD
+	// SONIX_TEST_DOP_REFUSE (host builds only): the emulator's null device
+	// takes any rate, so it is made to refuse DoP here instead.
+	if (pcm_handle && passthrough && getenv("SONIX_TEST_DOP_REFUSE")) {
+		snd_pcm_close(pcm_handle);
+		pcm_handle = NULL;
+		pcm_device_open = false;
+		open_error.code = -EINVAL;
+	}
+#endif
+	if (!pcm_handle && passthrough && open_error.code != -ENOMEM) {
+		// DSD256 asks for 705.6 kHz, which an output that is not this device's
+		// own DAC may simply refuse. Rather than a track that does not play,
+		// it is opened again and converted to PCM -- the route Bluetooth takes
+		// -- at a rate the output has (see usb_rate_plan).
+		fprintf(stderr, "audio: DoP at %d Hz refused by this output; the track is converted to PCM instead\n",
+				sample_rate);
+		set_dac_dop(0);
+		decoder_close(dec);
+		dsd_force_pcm = true;
+		play_decoded_file(filepath, format);
+		return;
+	}
+	if (!pcm_handle && passthrough) {
+		fprintf(stderr, "audio: DoP at %d Hz could not open (no memory); the track cannot play\n", sample_rate);
+	}
+	if (!pcm_handle) {
+		set_dac_dop(0);
+		decoder_close(dec);
+		retain_failed_output(filepath);
+		return;
+	}
+	track_started();
+
+	// From here, how long this track takes to start coming out is timed.
+	bt_start_probe_arm(pcm_handle);
+
+	double bytes_per_sec = (double)sample_rate * channels * (out_bits / 8);
+	int frame_bytes = channels * (out_bits / 8);
+	uint64_t paused_at_ms = 0; // monotonic pause anchor, including on MIPS o32
+	// In the track's frames: one chunk decimated is one chunk at the device.
+	snd_pcm_uframes_t chunk_frames = decimated_chunk(period_size, out_rate, decim_factor);
+	void *buffer = malloc(chunk_frames * frame_bytes);
+	if (!buffer) {
+		fprintf(stderr, "Audio: Out of memory for period buffer\n");
+		snd_pcm_close(pcm_handle);
+		set_dac_dop(0);
+		decoder_close(dec);
+		pthread_mutex_lock(&audio_mutex);
+		audio_command = AUDIO_CMD_STOP;
+		playback_status = AUDIO_STATUS_STOPPED;
+		pthread_mutex_unlock(&audio_mutex);
+		return;
+	}
+
+	// int64_t and not long: on the device (MIPS o32) long is 32 bit, and this
+	// counts PCM bytes. At 44.1 kHz 16-bit stereo that is 176,400 bytes a
+	// second, so a 32-bit sign flips after three and three quarter hours --
+	// the middle of a long audiobook, not an edge case. A negative count makes
+	// progress_current_secs negative and also decides whether a track finished
+	// or was cut short (cut_short, below), so the queue would advance on its
+	// own mid-book.
+	int64_t bytes_played = 0;
+	bool is_paused = false;
+	bool input_needs_rewind = false;
+	bool played_to_the_end = false;
+	int route_check = 0;
+	int track_route = alsa_output_key(); // the output auto_set_output just applied
+
+	// The time stretcher. Only on the 16-bit path: what it is for is
+	// audiobooks, which are AAC and so always 16-bit, and a hi-res FLAC has no
+	// business being played at 1.5x. NULL simply means the feature is not
+	// available and playback runs at 1.0.
+	speed_t *stretch = (out_bits == 16 || wide16) ? speed_open(channels, sample_rate) : NULL;
+	decoder_fill_t fill_ctx = {dec};
+	health_t health;
+	health_start(&health);
+
+	while (1) {
+		loop_turns++;
+		pthread_mutex_lock(&audio_mutex);
+		if (audio_command == AUDIO_CMD_STOP || play_request || stop_thread) {
+			pthread_mutex_unlock(&audio_mutex);
+			break;
+		}
+		if (seek_request) {
+			double target = seek_target_secs;
+			seek_request = false;
+			pthread_mutex_unlock(&audio_mutex);
+
+			uint64_t target_frame = (uint64_t)(target * sample_rate);
+			if (target_frame > total_frames) {
+				target_frame = total_frames;
+			}
+
+			// The requested point may not have downloaded yet. Clamping the
+			// request to where the download has reached would mean asking for
+			// 1:17 and landing at 0:51; a streaming app does the other thing --
+			// it stops on the requested point, downloads up to it, and resumes
+			// from there.
+			//
+			// So when the requested point is past the edge, wait for the edge
+			// to reach it -- progress bar parked on the requested point, card
+			// silent, and the wait giving up on any command (including another
+			// seek: the last touch always wins).
+			uint64_t reachable = decoder_seekable_limit(dec);
+			bool dropped_while_waiting = false;
+			if (reachable > 0 && target_frame > reachable && decoder_is_growing(dec)) {
+				fprintf(stderr, "audio[%ld]: the requested point has not downloaded yet: waiting for it\n", log_ms());
+				// Silence while waiting, when there is a stream to silence: a
+				// seek can arrive with the device handed back.
+				if (pcm_handle) {
+					snd_pcm_drop(pcm_handle);
+					dropped_while_waiting = true;
+				}
+
+				// The bar sits on the requested point: that is where this is going.
+				pthread_mutex_lock(&audio_mutex);
+				progress_current_secs = (double)target_frame / sample_rate;
+				pthread_mutex_unlock(&audio_mutex);
+
+				while (true) {
+					pthread_mutex_lock(&audio_mutex);
+					bool leave = audio_command != AUDIO_CMD_PLAY || play_request || seek_request;
+					pthread_mutex_unlock(&audio_mutex);
+					if (leave) {
+						break; // the top of the loop handles it
+					}
+					if (!decoder_is_growing(dec)) {
+						break; // finished (or died): go as far as possible
+					}
+					reachable = decoder_seekable_limit(dec);
+					if (reachable >= target_frame) {
+						fprintf(stderr, "audio[%ld]: the requested point has downloaded, resuming from there\n", log_ms());
+						break;
+					}
+					usleep(100 * 1000);
+				}
+				reachable = decoder_seekable_limit(dec);
+			}
+			// As far as is reachable now: if the wait was interrupted (or the
+			// download died) this is still the closest point to the requested
+			// one that actually exists.
+			if (reachable > 0 && target_frame > reachable) {
+				target_frame = reachable;
+			}
+
+			// If the seek fails -- which happens on a file still downloading
+			// when the requested point has not arrived -- go back to where the
+			// decoder was rather than leaving it nowhere: the music carries on
+			// from where it was, far better than playback dying for good.
+			uint64_t was_at = (uint64_t)(bytes_played / frame_bytes);
+			if (!decoder_seek_to_frame(dec, target_frame)) {
+				if (decoder_seek_to_frame(dec, was_at)) {
+					target_frame = was_at;
+				}
+			}
+			// What it is holding belongs to the part of the book just left.
+			speed_reset(stretch);
+			// Same for the crossfeed delay line: it holds half a millisecond of
+			// the point just left, which without this is heard crossing from
+			// one ear to the other.
+			crossfeed_reset();
+			if (decim_factor > 1) {
+				decimate_reset(&decim);
+			}
+			bt_resample_reset(&resampler);
+
+			// And the starvation flag recorded before the seek: it belonged to
+			// the old position (growfile_seek already clears it; this is the
+			// second turn of the key for formats that seek by other routes).
+			(void)decoder_take_starved(dec);
+
+			// As in the WAV loop above: no device means no stream to flush, and
+			// asking alsa to drop a null one aborts the audio thread.
+			if (pcm_handle) {
+				seek_flush(pcm_handle, dropped_while_waiting);
+				is_paused = false;
+				bt_seek_probe_arm(pcm_handle);
+			}
+
+			bytes_played = (int64_t)(target_frame * frame_bytes);
+			input_needs_rewind = false; // the explicit seek supersedes discarded input
+			pthread_mutex_lock(&audio_mutex);
+			progress_current_secs = (double)bytes_played / bytes_per_sec;
+			pthread_mutex_unlock(&audio_mutex);
+			continue;
+		}
+		if (audio_command == AUDIO_CMD_PAUSE) {
+			bool entering = !is_paused;
+			if (entering) {
+				is_paused = true;
+				playback_status = AUDIO_STATUS_PAUSED;
+			}
+			pthread_mutex_unlock(&audio_mutex);
+
+			if (entering) {
+				int64_t rewind_bytes = pause_stop_stream(pcm_handle, frame_bytes) * decim_factor;
+				if (resampler.on) {
+					// What is queued is at the link's rate.
+					rewind_bytes = rewind_bytes * out_rate / dev_rate;
+				}
+				if (rewind_bytes > 0 || input_needs_rewind) {
+					// The frames still queued were never heard: put the decoder
+					// back over them so resuming carries on from where the
+					// sound actually stopped instead of skipping a beat.
+					uint64_t played_frames = (uint64_t)(bytes_played / frame_bytes);
+					uint64_t rewind_frames = (uint64_t)(rewind_bytes / frame_bytes);
+					uint64_t resume_frame = played_frames > rewind_frames ? played_frames - rewind_frames : 0;
+					if (rewind_decoded_input(dec, resume_frame, stretch, decim_factor > 1 ? &decim : NULL, &resampler)) {
+						bytes_played = (int64_t)(resume_frame * frame_bytes);
+						pthread_mutex_lock(&audio_mutex);
+						progress_floor_secs = progress_current_secs; // the bar stays put
+						progress_current_secs = (double)bytes_played / bytes_per_sec;
+						pthread_mutex_unlock(&audio_mutex);
+					} else {
+						// A live/growing decoder may not support rewinding. Keep its
+						// previous continuation behavior instead of stopping the source.
+						fprintf(stderr, "Audio: decoded input cannot rewind after pause; continuing without rewind\n");
+					}
+					input_needs_rewind = false;
+				}
+			}
+
+			pthread_mutex_lock(&audio_mutex);
+			bool recover = resume_recover_pending;
+			resume_recover_pending = false;
+			pthread_mutex_unlock(&audio_mutex);
+			if (recover && pcm_handle) {
+				pcm_restart_after_pause(pcm_handle);
+			}
+
+			// Paused long enough: hand the device back so the DAC and the amp
+			// power down. The decoder keeps its place; the unpause opens a
+			// fresh stream and carries on from the same frame.
+			if (entering) {
+				paused_at_ms = paused_clock_ms();
+			}
+			paused_release_due(&pcm_handle, paused_at_ms);
+			paused_wait(pcm_handle != NULL, paused_at_ms);
+			continue;
+		} else {
+			// RESUME is one-shot: consumed here, back to PLAY -- see the twin
+			// comment in the WAV loop. Leaving it set poisons every "is a
+			// command pending?" test and the music comes out stuttering.
+			if (audio_command == AUDIO_CMD_RESUME) {
+				audio_command = AUDIO_CMD_PLAY;
+			}
+			if (is_paused) {
+				// An unpause always reopens the device from scratch -- see the
+				// twin comment in the WAV loop. Drop-at-pause plus
+				// prepare-at-resume leaves this driver's stream in a bad state:
+				// stuttering audio and a stuttering interface, since the
+				// real-time audio thread never yields the CPU. Open-then-write
+				// is the path every track start takes.
+				{
+					snd_pcm_uframes_t new_period = period_size;
+					if (!reopen_paused_pcm(&pcm_handle, channels, dev_rate, dev_bits, &new_period, passthrough)) {
+						pthread_mutex_unlock(&audio_mutex);
+						continue;
+					}
+					snd_pcm_uframes_t new_chunk = decimated_chunk(new_period, out_rate, decim_factor);
+					if (new_chunk > chunk_frames) {
+						void *bigger = realloc(buffer, new_chunk * frame_bytes);
+						if (!bigger) {
+							snd_pcm_close(pcm_handle);
+							pcm_handle = NULL;
+							pcm_device_open = false;
+							playback_follow(NULL);
+							audio_command = AUDIO_CMD_STOP;
+							playback_status = AUDIO_STATUS_STOPPED;
+							pthread_mutex_unlock(&audio_mutex);
+							break;
+						}
+						buffer = bigger;
+					}
+					chunk_frames = new_chunk;
+					period_size = new_period;
+					fprintf(stderr, "audio[%ld]: device taken back for the unpause\n", log_ms());
+					// A reopen is a fresh start for the sink as much as a new
+					// track is, and the clock has to start again with it: left
+					// armed from the track, the probe would charge the whole
+					// pause to the restart.
+					bt_start_probe_arm(pcm_handle);
+				}
+				is_paused = false;
+				playback_status = AUDIO_STATUS_PLAYING;
+			}
+		}
+		pthread_mutex_unlock(&audio_mutex);
+
+		// Every ~32 buffers: has the jack changed?
+		if (++route_check >= 32) {
+			route_check = 0;
+			int now_route = alsa_output_key();
+			if (now_route != track_route) {
+				track_route = now_route;
+				pcm_exact_rate = passthrough;
+				bool rerouted = pcm_reroute(&pcm_handle, channels, dev_rate, dev_bits, &period_size);
+				pcm_exact_rate = false;
+				if (!rerouted) {
+					fprintf(stderr, "Audio: reroute failed\n");
+					pthread_mutex_lock(&audio_mutex);
+					audio_command = AUDIO_CMD_STOP;
+					playback_status = AUDIO_STATUS_STOPPED;
+					pthread_mutex_unlock(&audio_mutex);
+					break;
+				}
+			}
+		}
+
+		// PAUSE may already have been replaced by RESUME. Rebuild discarded
+		// input before decoding again, also after a positive partial BT write.
+		if (input_needs_rewind) {
+			if (!rewind_decoded_input(dec, (uint64_t)(bytes_played / frame_bytes), stretch,
+									 decim_factor > 1 ? &decim : NULL, &resampler)) {
+				fprintf(stderr, "Audio: decoded input cannot restore an unwritten block; continuing without rewind\n");
+			}
+			input_needs_rewind = false;
+		}
+
+		// --- the reserve of a track that is still downloading ----------------
+		//
+		// A streamed track plays while it downloads. Ahead of the play position
+		// is a reserve of bytes already received; when the network slows down
+		// the reserve is consumed and the decoder asks for data that is not
+		// there. Trickling onwards means the read blocks, the card runs its
+		// buffer dry and underruns, recovers and underruns again -- audible
+		// stutter, and after eight consecutive attempts the write gives up and
+		// the track dies.
+		//
+		// A streaming app instead stops, refills, and resumes. So does this.
+		if (decoder_is_growing(dec)) {
+			rebuffer_if_starved(dec, sample_rate, bytes_played / (uint64_t)frame_bytes);
+		}
+
+		// How many frames came out (what goes to the card) and how many went
+		// in (what the position in the track advances by). The two are the
+		// same at normal speed, and deliberately not at any other.
+		uint64_t frames_read;
+		uint64_t input_frames;
+		// Before the decode, as a seek or a resume this turn has just emptied
+		// the stream (see playback_follow).
+		playback_follow(pcm_handle);
+		health_mark(&health);
+		if (out_bits == 32) {
+			if (wide16) {
+				// Read into the back half of the block and widened forwards:
+				// each S32 sample lands on S16 ones already widened.
+				short *narrow = (short *)buffer + chunk_frames * (snd_pcm_uframes_t)channels;
+				frames_read = read_s16_block(stretch, dec, &fill_ctx, narrow, chunk_frames, &input_frames);
+				int32_t *wide = buffer;
+				for (uint64_t i = 0; i < frames_read * (uint64_t)channels; i++) {
+					wide[i] = (int32_t)narrow[i] * 65536;
+				}
+			} else {
+				frames_read = decoder_read_pcm_frames_s32(dec, chunk_frames, (int32_t *)buffer);
+				input_frames = frames_read;
+			}
+			health_lap(&health, STAGE_READ);
+			if (frames_read != 0 && decim_factor > 1) {
+				frames_read = (uint64_t)decimate_s32(&decim, (int32_t *)buffer, (int)frames_read);
+				if (frames_read == 0) {
+					// Too few frames for one output frame; the delay lines
+					// hold them.
+					bytes_played += (int64_t)input_frames * frame_bytes;
+					continue;
+				}
+			}
+			if (frames_read != 0 && !passthrough && !pure_now()) {
+				// ReplayGain first: it is a correction to the source level, so
+				// everything after it works on the level the listener will
+				// actually hear.
+				replaygain_process_s32((int32_t *)buffer, (int)frames_read, channels);
+				eq_process_s32((int32_t *)buffer, (int)frames_read, channels, out_rate);
+				soundfield_process_s32((int32_t *)buffer, (int)frames_read, channels);
+				// Crossfeed after soundfield and before balance: one widens the
+				// image, this pulls it back inside the head, and balance stays
+				// the last word on what reaches each ear.
+				crossfeed_process_s32((int32_t *)buffer, (int)frames_read, channels, out_rate);
+				mono_process_s32((int32_t *)buffer, (int)frames_read, channels);
+				balance_process_s32((int32_t *)buffer, (int)frames_read, channels);
+			}
+		} else {
+			frames_read = read_s16_block(stretch, dec, &fill_ctx, (short *)buffer, chunk_frames, &input_frames);
+			health_lap(&health, STAGE_READ);
+			if (frames_read != 0 && !pure_now()) {
+				replaygain_process((short *)buffer, (int)frames_read, channels);
+				// The graphic EQ, in place on the decoded block. A no-op when off.
+				eq_process((short *)buffer, (int)frames_read, channels, sample_rate);
+				// ...then the stereo width, at the end of the chain.
+				soundfield_process((short *)buffer, (int)frames_read, channels);
+				// Crossfeed right after: what soundfield widened, this pulls
+				// back inside the head.
+				crossfeed_process((short *)buffer, (int)frames_read, channels, sample_rate);
+				// Last in the chain, after everything that could have changed
+				// the level: the balance is about what reaches each ear.
+				mono_process((short *)buffer, (int)frames_read, channels);
+				balance_process((short *)buffer, (int)frames_read, channels);
+			}
+		}
+
+		// Has the decoder reached the edge of the download? Two signals:
+		//
+		//   * the read came back short (the simple case);
+		//   * the read came back full but had to wait (decoder_take_starved).
+		//     growfile fills the read by waiting for chunks, so from here it
+		//     looks normal -- except every read costs a tenth of a second and
+		//     every write is an underrun.
+		//
+		// Either way, do not trickle onwards: stop and refill, like any
+		// streaming app. (What the read already produced is still played below:
+		// the gap starts after the last good sample.)
+		uint64_t read_count = decim_factor > 1 ? input_frames : frames_read;
+		if (decoder_is_growing(dec) && (read_count < chunk_frames || decoder_take_starved(dec))) {
+			rebuffer_after_short_read(dec, sample_rate, (uint64_t)(bytes_played / frame_bytes));
+			if (frames_read == 0) {
+				// Nothing at all came out: retry after refilling. Falling
+				// through would declare "track finished" for a track merely
+				// stuck at the edge. If the download did die, the next pass
+				// sees a file that no longer grows and the cut-short branch
+				// decides the ending.
+				continue;
+			}
+		}
+
+		if (frames_read == 0) {
+			// First of all: the read can have come back empty not because the
+			// file ended but because a pending command made it give up
+			// (growfile's wake-up). Pause, stop, another track, a seek --
+			// whichever it is, the top of the loop handles it: a pause must
+			// pause, not end the track.
+			pthread_mutex_lock(&audio_mutex);
+			bool command_pending = audio_command != AUDIO_CMD_PLAY || play_request || seek_request;
+			pthread_mutex_unlock(&audio_mutex);
+			if (command_pending) {
+				continue;
+			}
+
+			// Nothing at all came out of this file: that is a failed read, not
+			// a track that finished. Reported as a completion, the UI would
+			// auto-advance, the next file would read short too, and the queue
+			// would walk on in silence. The card can be briefly unreadable
+			// after a spell with the screen off (the same reason decoder_open
+			// already retries), so the track gets one retry and then stops
+			// WITHOUT claiming it played.
+			if (bytes_played == 0) {
+				fprintf(stderr, "audio[%ld]: '%s' returned no audio at all\n", log_ms(), filepath);
+				if (retry_track_once(filepath, "nothing decoded")) {
+					break;
+				}
+				pthread_mutex_lock(&audio_mutex);
+				audio_command = AUDIO_CMD_STOP;
+				playback_status = AUDIO_STATUS_STOPPED;
+				pthread_mutex_unlock(&audio_mutex);
+				break;
+			}
+
+			// End of track -- if it really is the end.
+			//
+			// The queue must never walk on by itself. It advances when a track
+			// reaches its end and in no other case. Two lies that look like an
+			// end are rejected here:
+			//
+			//   * a stop or another track arrived while blocked in the last
+			//     read. That is an interrupted read, not an end: treating it as
+			//     one sends the queue on top of what the user just asked for;
+			//   * the file ended well short of its duration. This happens to
+			//     tracks played while downloading: if the download dies, what is
+			//     on disk stops halfway and the read comes back empty. It looks
+			//     like the end of the track, but the track is twice as long.
+			//
+			// Without the second test the player walks itself through the whole
+			// list: every truncated track advances the queue, and the next one --
+			// not downloaded yet -- is truncated in turn.
+			uint64_t declared = decoder_total_pcm_frames(dec);
+			uint64_t reached = (uint64_t)(bytes_played / frame_bytes);
+			bool cut_short = declared > 0 && sample_rate > 0 && reached + (uint64_t)sample_rate < declared;
+
+			pthread_mutex_lock(&audio_mutex);
+			bool natural_end = audio_command != AUDIO_CMD_STOP && !play_request && !cut_short;
+			audio_command = AUDIO_CMD_STOP;
+			playback_status = AUDIO_STATUS_STOPPED;
+			track_completed = natural_end;
+			pthread_mutex_unlock(&audio_mutex);
+			played_to_the_end = natural_end;
+			if (natural_end && completion_hook) {
+				completion_hook();
+			}
+
+			if (cut_short) {
+				fprintf(stderr, "audio[%ld]: '%s' stopped at %.1f s of %.1f: cut short, the queue stays put\n", log_ms(),
+						filepath, (double)reached / sample_rate, (double)declared / sample_rate);
+			}
+			break;
+		}
+
+		// The fade is a gain, so it is one more thing a DoP stream cannot have.
+		if (fade_enabled && !passthrough && !pure_now()) {
+			int gain = fade_gain_q10((double)bytes_played / bytes_per_sec, (double)total_frames / sample_rate);
+			int samples = (int)frames_read * channels;
+			if (out_bits == 32) {
+				fade_apply_s32((int32_t *)buffer, samples, gain);
+			} else {
+				fade_apply_s16((short *)buffer, samples, gain);
+			}
+		}
+
+		// And the software volume, under the same rule and for the same reason:
+		// scaling a DoP stream would stop it being DSD and start being noise.
+		if (swvolume_active() && !passthrough) {
+			int samples = (int)frames_read * channels;
+			if (out_bits == 32) {
+				swvolume_apply_s32((int32_t *)buffer, samples);
+			} else {
+				swvolume_apply_s16((short *)buffer, samples);
+			}
+		}
+
+		// To the link's rate, last: the effects ran at the track's.
+		const void *out_block = buffer;
+		uint64_t out_frames = frames_read;
+		if (resampler.on) {
+			int made = 0;
+			out_block = bt_resample_block(&resampler, buffer, out_bits, (int)frames_read, channels, &made);
+			if (!out_block) {
+				fprintf(stderr, "Audio: Out of memory for the resampler\n");
+				pthread_mutex_lock(&audio_mutex);
+				audio_command = AUDIO_CMD_STOP;
+				playback_status = AUDIO_STATUS_STOPPED;
+				pthread_mutex_unlock(&audio_mutex);
+				break;
+			}
+			out_frames = (uint64_t)made;
+			if (out_frames == 0) {
+				// The filter holds it until the next block.
+				bytes_played += (int64_t)input_frames * frame_bytes;
+				continue;
+			}
+		}
+		// And to 16 bits, last of all, for an output that takes no more.
+		if (dither) {
+			dither_to_s16(&dither_seed, (void *)out_block, (int)out_frames * channels);
+		}
+
+		health_lap(&health, STAGE_EFFECTS);
+		snd_pcm_sframes_t written =
+			pcm_write_recover(&pcm_handle, out_block, out_frames, channels, dev_rate, dev_bits, &period_size);
+		health_lap(&health, STAGE_WRITE);
+
+		if (written == -EINTR) {
+			// Not an error: a command (pause, stop, another track, a seek)
+			// arrived while waiting for room in the buffer. The top of the
+			// loop handles it. A pause/resume must retain the unwritten input,
+			// even when the PCM was empty and has no queued frames to rewind.
+			input_needs_rewind = true;
+			continue;
+		}
+		if (written < 0 || !pcm_handle) {
+			fprintf(stderr, "Audio: Write failed beyond recovery: %s\n", snd_strerror((int)written));
+			input_needs_rewind = true;
+			pause_failed_output();
+			continue;
+		}
+
+		bt_seek_probe_report(pcm_handle);
+		bt_start_probe_note(pcm_handle, written, dev_rate);
+
+		// The position moves by INPUT frames: at 1.5x, one period written to
+		// the card is a period and a half of the book. Scaled by how much of
+		// the block the card actually took, for the rare partial write.
+		if (out_frames > 0) {
+			bytes_played += (int64_t)((double)written * frame_bytes * (double)input_frames / (double)out_frames);
+		}
+		input_needs_rewind = (uint64_t)written < out_frames;
+		if (input_needs_rewind) {
+			bytes_played -= bytes_played % frame_bytes; // decoder seeks whole source frames
+		}
+		health_tick(&health, sample_rate, dev_rate, source_bits);
+		host_pace(written, dev_rate);
+		pthread_mutex_lock(&audio_mutex);
+		report_position((double)bytes_played / bytes_per_sec);
+		pthread_mutex_unlock(&audio_mutex);
+	}
+
+	pthread_mutex_lock(&audio_mutex);
+	mark_stopped_unless_replaced();
+	pthread_mutex_unlock(&audio_mutex);
+
+	// The track ended on its own, gapless is on and nothing special happened:
+	// the PCM stays open with its queue inside and the next track appends to
+	// it. See the comment above gapless_release() for the conditions and the
+	// reason behind each.
+	//
+	// Over Bluetooth only while the handle is live: see bt_hold_usable().
+	bool keep_open = pcm_handle && gapless_enabled && played_to_the_end && !is_paused && !passthrough &&
+					 (!pcm_is_bluetooth(pcm_handle) || bt_hold_usable(pcm_handle));
+	if (keep_open) {
+		gapless_hold(pcm_handle, channels, dev_rate, dev_bits, period_size);
+		pcm_handle = NULL;
+	}
+
+	if (pcm_handle) {
+		bool was_paused = is_paused;
+		// Asked before the close, because afterwards there is no handle to ask.
+		bool was_bluetooth = pcm_is_bluetooth(pcm_handle);
+		// Nothing to un-pause: a paused stream was dropped when the pause
+		// began, so it is already stopped and safe to close. Only a track that
+		// reached its end is drained -- every other exit is a switch to
+		// something else, and the tail of the old track is not wanted.
+		if (played_to_the_end) {
+			// A track shorter than the buffer may never have reached the start
+			// threshold: the stream is still PREPARED with the whole track
+			// queued. Start it by hand, or the drain has nothing to flush and
+			// those last moments are never heard.
+			if (snd_pcm_state(pcm_handle) == SND_PCM_STATE_PREPARED) {
+				snd_pcm_start(pcm_handle);
+			}
+			pcm_drain_bounded(pcm_handle);
+		} else {
+			snd_pcm_drop(pcm_handle);
+			}
+		snd_pcm_close(pcm_handle);
+
+		// A stream that sat paused (a track left paused while the screen was
+		// off, then skipped) leaves the codec idle, and the driver wants a
+		// moment before it will hand out the device again. Without this the
+		// next track's open can come back busy, and that track never plays.
+		if (was_paused) {
+			usleep(120 * 1000);
+		} else if (was_bluetooth) {
+			// The same moment, for the same reason, at the other device. The
+			// close above does not end at the plugin: bluealsa still has to
+			// hand the A2DP transport back to bluez over D-Bus, and the next
+			// track's open has to make it take it again. Reopening into the
+			// middle of that is a race nobody wins, and on a card the identical
+			// race is already waited out three lines up.
+			//
+			// A fifth of a second, against a link that already carries the best
+			// part of a second of buffer. Only when the handle was not held for
+			// the next track.
+			usleep(BT_REOPEN_SETTLE_MS * 1000);
+		}
+	}
+	pcm_device_open = keep_open;
+	pthread_mutex_lock(&audio_mutex);
+	stream_dsd_multiple = 0;
+	pthread_mutex_unlock(&audio_mutex);
+	// Off again with the stream. A DAC left in DSD mode reads the next
+	// ordinary track's words as bits and plays noise at full level, so this
+	// belongs on the way out of every exit from this function, not only the
+	// tidy one.
+	if (!keep_open) {
+		set_dac_dop(0);
+	}
+	free(buffer);
+	bt_resample_close(&resampler);
+	speed_close(stretch);
+	decoder_close(dec);
+}
+
+static void play_file(const char *filepath) {
+	// One line in, one line out: with these, the log answers by itself
+	// whether a track that "never started" was never picked up, failed to
+	// open, or started and ended at once.
+	fprintf(stderr, "audio[%ld]: starting '%s'\n", log_ms(), filepath);
+
+	// And where the crash handler can reach it: a log ends at whatever was
+	// flushed, and a process killed rather than faulting writes nothing at all,
+	// so the name of the track has to be somewhere a signal handler can read it
+	// without going through a stream.
+	crumb_set_track(filepath);
+
+	decode_format_t format = decode_detect_format(filepath);
+	// The route, applied here: no PCM exists in this thread right now, so
+	// the codec switch can never stall a live stream (decompile: the stock
+	// remaps po/spdif via its engine's reinit flag, never on a live device).
+	//
+	// With gapless there can very much be one -- the PCM held open by the
+	// previous track, its queue still playing. If the route changed (headphones
+	// plugged in between the two tracks) that PCM must be closed before the
+	// codec is reprogrammed, not after.
+	if (gapless_holding() && alsa_output_key() != held_route) {
+		gapless_release();
+	}
+	// Before the route is written, not only before the PCM is opened: writing
+	// the codec route while another stream's PCM is open is the move that
+	// wedges this driver (see pcm_reroute), and this is the one place on the
+	// way into a track where nothing is holding a lock.
+	// No stream of this player's is playing out: the route and the open that
+	// follow can wait for the interface (see playback_follow).
+	if (!gapless_holding()) {
+		playback_follow(NULL);
+	}
+	release_external_output();
+	auto_set_output();
+
+	if (format == DECODE_FORMAT_UNKNOWN) {
+		play_wav_file(filepath);
+	} else {
+		play_decoded_file(filepath, format);
+	}
+	// A held stream may still be playing out its last buffer.
+	playback_set_rt(true);
+
+	pthread_mutex_lock(&audio_mutex);
+	bool replaced = play_request;
+	pthread_mutex_unlock(&audio_mutex);
+	fprintf(stderr, "audio[%ld]: '%s' ended (%s)\n", log_ms(), filepath,
+			replaced ? "replaced by a new track" : "stop or end of track");
+}
+
+static void *playback_thread_func(void *arg) {
+	(void)arg;
+	// The name, and only the name -- not thread_be_background(), which also puts
+	// the caller on SCHED_IDLE, and this is the one thread that must never wait
+	// behind anything. /proc/self/task/*/comm is what the watchdog's dump
+	// prints, and a stall report that says "sonix_player_ho" three times over
+	// does not say which thread stopped.
+	prctl(PR_SET_NAME, "playback", 0, 0, 0);
+
+	// This thread runs the decoders, so it is the one a malformed file can
+	// recurse to the bottom of its stack: give it somewhere for the crash
+	// handler to run.
+	thread_signal_stack();
+
+	// Real-time round-robin, modestly: the UI decoding a 9 MB cover on the
+	// one core must never starve the thread that feeds the DAC. Failing is
+	// fine (the host build has no privilege for it).
+	playback_set_rt(true);
+	if (playback_rt) {
+		fprintf(stderr, "audio: playback thread running at RT priority\n");
+	}
+
+	while (1) {
+		pthread_mutex_lock(&audio_mutex);
+		while (!play_request && !stop_thread) {
+			// Suspend-to-RAM is about to start: any held PCM has to be closed
+			// now, not in GAPLESS_HOLD_MS. Only this thread may close it, so
+			// the request lands here.
+			if (hold_flush_request) {
+				hold_flush_request = false;
+				pthread_mutex_unlock(&audio_mutex);
+				gapless_release();
+				pthread_mutex_lock(&audio_mutex);
+				continue;
+			}
+			if (!gapless_holding()) {
+				pthread_cond_wait(&audio_cond, &audio_mutex);
+				continue;
+			}
+
+			// With a PCM held open (gapless) the wait is bounded: if the next
+			// track does not arrive soon, what the card has queued runs out and
+			// the PCM must be closed instead of sitting there holding the DAC.
+			struct timespec until;
+			clock_gettime(CLOCK_REALTIME, &until);
+			until.tv_nsec += (long)GAPLESS_HOLD_MS * 1000000L;
+			until.tv_sec += until.tv_nsec / 1000000000L;
+			until.tv_nsec %= 1000000000L;
+
+			if (pthread_cond_timedwait(&audio_cond, &audio_mutex, &until) == ETIMEDOUT) {
+				// Outside the lock: closing a PCM can mean waiting for the
+				// card to finish, and the interface must not queue behind that.
+				pthread_mutex_unlock(&audio_mutex);
+				gapless_release();
+				pthread_mutex_lock(&audio_mutex);
+			}
+		}
+		if (stop_thread) {
+			pthread_mutex_unlock(&audio_mutex);
+			// A PCM held open by gapless does not go away on its own.
+			gapless_release();
+			break;
+		}
+
+		char filepath[512];
+		strncpy(filepath, current_filepath, sizeof(filepath));
+		play_request = false;
+		play_request_ms = 0;
+		track_starting = true;
+		playback_context_active = true;
+		pthread_mutex_unlock(&audio_mutex);
+
+		play_file(filepath);
+		track_started(); // a track that never reached its open
+
+		pthread_mutex_lock(&audio_mutex);
+		playback_context_active = false;
+		pthread_mutex_unlock(&audio_mutex);
+	}
+	return NULL;
+}
+
+// What growfile asks every tenth of a second while the audio thread waits for
+// a chunk that is not coming: is there a reason to give up? A stop, a pause,
+// another track queued, or a seek. Without it the thread stays in that wait for
+// up to twenty seconds after the key was pressed, and from outside the player
+// looks dead: prev does nothing and local tracks will not start.
+static bool playback_reader_should_abort(void) {
+	pthread_mutex_lock(&audio_mutex);
+	bool out = audio_command != AUDIO_CMD_PLAY || play_request || stop_thread || seek_request;
+	pthread_mutex_unlock(&audio_mutex);
+	return out;
+}
+
+#ifdef HOST_BUILD
+// SONIX_TEST_EXTERNAL=<raw file>:<rate>:<bits> plays a raw stereo file (S16 or
+// S32) through audio_external_write() a few seconds after start-up, in the
+// chunks a receiver hands over, so the external path can be measured in the
+// emulator the way the file player is. Host builds only.
+static void *external_test_thread(void *arg) {
+	(void)arg;
+	char spec[600];
+	snprintf(spec, sizeof(spec), "%s", getenv("SONIX_TEST_EXTERNAL"));
+	char *colon = strrchr(spec, ':');
+	int bits = colon ? atoi(colon + 1) : 16;
+	if (colon) {
+		*colon = '\0';
+	}
+	colon = strrchr(spec, ':');
+	int rate = colon ? atoi(colon + 1) : 44100;
+	if (colon) {
+		*colon = '\0';
+	}
+	sleep(3);
+	FILE *f = fopen(spec, "rb");
+	if (!f || (bits != 16 && bits != 32) || !audio_external_begin(rate, 2, bits)) {
+		fprintf(stderr, "audio: SONIX_TEST_EXTERNAL could not start\n");
+		if (f) {
+			fclose(f);
+		}
+		return NULL;
+	}
+	const int frame = 2 * bits / 8;
+	unsigned char chunk[441 * 8];
+	size_t got;
+	while ((got = fread(chunk, (size_t)frame, 441, f)) > 0) {
+		audio_external_write(chunk, (int)got);
+	}
+	fclose(f);
+	audio_external_end();
+	fprintf(stderr, "audio: SONIX_TEST_EXTERNAL done\n");
+	return NULL;
+}
+#endif
+
+int audio_init(void) {
+	static bool initialized = false;
+	if (initialized)
+		return 0;
+
+	growfile_set_reader_abort_cb(playback_reader_should_abort);
+	playback_wake_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+	if (playback_wake_fd < 0) {
+		fprintf(stderr, "audio: eventfd unavailable, using bounded PCM waits: %s\n", strerror(errno));
+	}
+
+	set_volume_percent(40); // a sane, audible default on the new dB taper
+	auto_set_output();
+
+	pthread_mutex_lock(&audio_mutex);
+	stop_thread = false;
+	play_request = false;
+	play_request_ms = 0;
+	audio_command = AUDIO_CMD_STOP;
+	playback_status = AUDIO_STATUS_STOPPED;
+	pthread_mutex_unlock(&audio_mutex);
+
+	int err = pthread_create(&playback_thread, NULL, playback_thread_func, NULL);
+	if (err != 0) {
+		fprintf(stderr, "Audio: Failed to create background thread\n");
+		if (playback_wake_fd >= 0) {
+			close(playback_wake_fd);
+			playback_wake_fd = -1;
+		}
+		return -1;
+	}
+
+#ifdef HOST_BUILD
+	if (getenv("SONIX_TEST_EXTERNAL")) {
+		pthread_t test;
+		if (pthread_create(&test, NULL, external_test_thread, NULL) == 0) {
+			pthread_detach(test);
+		}
+	}
+#endif
+
+	initialized = true;
+	return 0;
+}
+
+int audio_play(const char *filepath) {
+	fprintf(stderr, "audio[%ld]: play requested '%s'\n", log_ms(), filepath);
+
+	// NO route write here: this runs on the UI thread while the previous
+	// track's PCM may still be open, and poking "Output Port Switch" with a
+	// configured stream up stalls the DMA (the after-headphone-plug wedge).
+	// The playback thread routes at track start, the stock engine's way.
+
+	pthread_mutex_lock(&audio_mutex);
+	resume_request_serial++;
+	progress_serial++;
+	restart_fresh_pending = false; // an explicit play beats the armed restart
+	strncpy(current_filepath, filepath, sizeof(current_filepath) - 1);
+	play_request = true;
+	play_request_ms = log_ms();
+	write_fail_retry_used = false;
+	audio_command = AUDIO_CMD_PLAY;
+	playback_status = AUDIO_STATUS_PLAYING;
+
+	// Zero the progress now instead of leaving the outgoing track's numbers up
+	// until the thread has opened the new file: the UI polls this at any
+	// moment, and stale values make the bar jump back to where the previous
+	// track was before snapping to the new one.
+	progress_current_secs = 0.0;
+	progress_floor_secs = -1.0;
+	progress_total_secs = 0.0;
+	stream_sample_rate = 0;
+	stream_device_rate = 0;
+	stream_channels = 0;
+	seek_request = false;
+	seek_target_secs = -1.0;
+	stream_bits = 0;
+	stream_bitrate_kbps = 0;
+	stream_lossy = false;
+	stream_codec[0] = '\0';
+	track_completed = false; // fresh playback; any prior completion is consumed
+	pthread_cond_signal(&audio_cond);
+	pthread_mutex_unlock(&audio_mutex);
+	playback_wake();
+	return 0;
+}
+
+// Play a file starting somewhere other than its beginning: an audiobook picked
+// up where it was left. Same shape as audio_play_paused() -- which comes up
+// PAUSED at `start_secs` for the boot-time "remember track" restore, consuming
+// the queued PAUSE and the queued seek before a frame is written, so nothing
+// is heard until play is pressed. Both are functions of their own rather than
+// a play followed by a seek because both halves are set under one hold of the
+// mutex: otherwise the playback thread could open the file and push its first
+// second out of the speakers before the seek reached it.
+int audio_play_at(const char *filepath, double start_secs) {
+	fprintf(stderr, "audio[%ld]: play requested '%s' from %.1f s\n", log_ms(), filepath, start_secs);
+
+	pthread_mutex_lock(&audio_mutex);
+	resume_request_serial++;
+	progress_serial++;
+	restart_fresh_pending = false; // an explicit play beats the armed restart
+	strncpy(current_filepath, filepath, sizeof(current_filepath) - 1);
+	current_filepath[sizeof(current_filepath) - 1] = '\0';
+	play_request = true;
+	play_request_ms = log_ms();
+	write_fail_retry_used = false;
+	audio_command = AUDIO_CMD_PLAY;
+	playback_status = AUDIO_STATUS_PLAYING;
+	seek_request = start_secs > 0;
+	seek_target_secs = seek_request ? start_secs : -1.0;
+	progress_current_secs = start_secs > 0 ? start_secs : 0;
+	progress_floor_secs = -1.0;
+	progress_total_secs = 0;
+	pthread_mutex_unlock(&audio_mutex);
+
+	pthread_cond_signal(&audio_cond);
+	playback_wake();
+	return 0;
+}
+
+int audio_play_paused(const char *filepath, double start_secs) {
+	fprintf(stderr, "audio[%ld]: restore requested '%s' at %.1f s (paused)\n", log_ms(), filepath, start_secs);
+
+	pthread_mutex_lock(&audio_mutex);
+	resume_request_serial++;
+	progress_serial++;
+	restart_fresh_pending = false; // an explicit play beats the armed restart
+	strncpy(current_filepath, filepath, sizeof(current_filepath) - 1);
+	current_filepath[sizeof(current_filepath) - 1] = '\0';
+	play_request = true;
+	play_request_ms = log_ms();
+	write_fail_retry_used = false;
+	audio_command = AUDIO_CMD_PAUSE;
+	playback_status = AUDIO_STATUS_PAUSED;
+	seek_request = start_secs > 0;
+	seek_target_secs = seek_request ? start_secs : -1.0;
+	progress_current_secs = start_secs > 0 ? start_secs : 0;
+	progress_floor_secs = -1.0;
+	progress_total_secs = 0;
+	pthread_mutex_unlock(&audio_mutex);
+
+	pthread_cond_signal(&audio_cond);
+	playback_wake();
+	return 0;
+}
+
+// audio_notify_resume() below is told by the power manager the moment the SoC
+// comes back from suspend: the stream a paused track left open is SUSPENDED by
+// then. The playback thread does the recovery itself rather than having ALSA
+// poked from the interface thread.
+bool audio_device_is_open(void) { return pcm_device_open; }
+
+// Lock-free for the same reason as the function below: the reader is a
+// background thread that must never wait on the playback thread.
+long audio_quiet_ms(void) {
+	if (play_request || track_starting || pcm_opening) {
+		return -1;
+	}
+	long since = log_ms() - quiet_since_ms;
+	return since > 0 ? since : 0;
+}
+
+// How long the pending play request has been waiting, or 0 when there is none.
+//
+// Read without taking audio_mutex on purpose: the caller is the watchdog, and
+// the case it exists to report is the playback thread not coming back -- which
+// can be inside snd_pcm_open() on a slow or disconnected output.
+// A watchdog that blocks on the very lock it is investigating reports nothing.
+// Both values are a word wide on this target, so the worst a lock-free read can
+// see is the state from an instant ago.
+long audio_play_request_age_ms(void) {
+	if (!play_request || play_request_ms == 0) {
+		return 0;
+	}
+	long age = log_ms() - play_request_ms;
+	return age > 0 ? age : 0;
+}
+
+void audio_notify_resume(void) {
+	pthread_mutex_lock(&audio_mutex);
+	resume_request_serial++;
+	resume_recover_pending = true;
+	pthread_mutex_unlock(&audio_mutex);
+	playback_wake();
+}
+
+// Everything down before mem. Reverse engineering of the stock binary shows
+// its standby routine issues STOP, waits for the STOPPED state and only then
+// writes `mem`: no ALSA object may exist while the SoC stops, because the AIC
+// inside the SoC loses its registers and a handle that outlives it is the
+// shortest path to the reboot on the first play. This forces the gapless PCM
+// closed and waits -- with a cap -- for the playback thread to release the
+// device. Returns true once nothing is open. It does not stop the music: the
+// caller must already have decided that (the prototype only suspends when
+// stopped).
+bool audio_suspend_quiesce(int timeout_ms) {
+	pthread_mutex_lock(&audio_mutex);
+	hold_flush_request = true;
+	pthread_cond_broadcast(&audio_cond);
+	pthread_mutex_unlock(&audio_mutex);
+	playback_wake();
+
+	for (int waited = 0; waited < timeout_ms; waited += 20) {
+		if (!pcm_device_open && !gapless_holding()) {
+			return true;
+		}
+		usleep(20 * 1000);
+	}
+	return !pcm_device_open && !gapless_holding();
+}
+
+bool audio_playback_context_active(void) { return playback_context_active; }
+
+// The real freeze, for mem. ALSA objects are not enough: a paused track keeps
+// play_file() alive with the decoder and a FILE* open on the card, the card
+// loses power in mem, and the first play after wake -- an unpause of that
+// context -- reboots the device. This does what the stock binary does: a real
+// STOP, a wait for the context to be genuinely dead (play_file returned, not
+// merely the status changed), and "next play = fresh restart" armed with the
+// saved path and position.
+//
+// The logical state is left at PAUSED when there was a track, so the play
+// button still reads as "resume", and that resume -- intercepted in
+// audio_resume() -- becomes the fresh start from the right point.
+bool audio_suspend_freeze(int timeout_ms) {
+	pthread_mutex_lock(&audio_mutex);
+	resume_request_serial++;
+	bool was_paused = playback_status == AUDIO_STATUS_PAUSED;
+	char path[512];
+	snprintf(path, sizeof(path), "%s", current_filepath);
+	double pos = progress_current_secs;
+	double total = progress_total_secs;
+
+	// STOP, exactly as the user would send it, and a wake-up for any waiter.
+	audio_command = AUDIO_CMD_STOP;
+	playback_status = AUDIO_STATUS_STOPPED;
+	seek_request = false;
+	seek_target_secs = -1.0;
+	track_completed = false;
+	hold_flush_request = true;
+	pthread_cond_broadcast(&audio_cond);
+	pthread_mutex_unlock(&audio_mutex);
+	playback_wake();
+
+	// Wait for the real teardown: context dead, PCM closed, gapless empty.
+	bool clean = false;
+	for (int waited = 0; waited <= timeout_ms && !clean; waited += 20) {
+		clean = !playback_context_active && !pcm_device_open && !gapless_holding();
+		if (!clean) {
+			usleep(20 * 1000);
+		}
+	}
+	if (!clean) {
+		fprintf(stderr, "audio: freeze failed (context=%d pcm=%d gapless=%d)\n",
+				(int)playback_context_active, (int)pcm_device_open, (int)gapless_holding());
+		return false;
+	}
+
+	if (was_paused && path[0]) {
+		pthread_mutex_lock(&audio_mutex);
+		restart_fresh_pending = true;
+		snprintf(restart_fresh_path, sizeof(restart_fresh_path), "%s", path);
+		restart_fresh_pos = pos;
+		// The facade stays "paused where you were": the context underneath is
+		// dead, but the next play rebuilds it.
+		playback_status = AUDIO_STATUS_PAUSED;
+		snprintf(current_filepath, sizeof(current_filepath), "%s", path);
+		progress_current_secs = pos;
+		progress_total_secs = total;
+		pthread_mutex_unlock(&audio_mutex);
+		fprintf(stderr, "audio: frozen while paused: '%s' at %.1f s, fresh restart armed\n", path, pos);
+	} else {
+		fprintf(stderr, "audio: frozen while stopped\n");
+	}
+	return true;
+}
+
+void audio_pause(void) {
+	printf("pausing\n");
+	pthread_mutex_lock(&audio_mutex);
+	resume_request_serial++;
+	audio_command = AUDIO_CMD_PAUSE;
+
+	// Report the new state immediately instead of waiting for the playback
+	// thread to notice the command. It only looks at it between PCM writes, so
+	// for up to a period's worth of audio the status would still say PLAYING --
+	// and a second tap in that window would ask for a pause again instead of a
+	// resume, leaving the button stuck on the play glyph.
+	playback_status = AUDIO_STATUS_PAUSED;
+	pthread_mutex_unlock(&audio_mutex);
+	playback_wake();
+}
+
+void audio_resume(void) {
+	// A freeze or failed initial output open may leave no track context, so
+	// a cold "resume" here means
+	// rebuilding everything from scratch at the right point -- fresh decoder,
+	// fresh route, fresh PCM. That is the same path every track start takes.
+	pthread_mutex_lock(&audio_mutex);
+	if (restart_fresh_pending && restart_fresh_path[0]) {
+		char path[512];
+		snprintf(path, sizeof(path), "%s", restart_fresh_path);
+		double pos = restart_fresh_pos;
+		restart_fresh_pending = false;
+		pthread_mutex_unlock(&audio_mutex);
+		fprintf(stderr, "audio: cold resume -> fresh start of '%s' at %.1f s\n", path, pos);
+		audio_play_at(path, pos);
+		return;
+	}
+	pthread_mutex_unlock(&audio_mutex);
+
+	printf("resuming\n");
+
+	pthread_mutex_lock(&audio_mutex);
+	resume_request_serial++;
+	audio_command = AUDIO_CMD_RESUME;
+
+	// Same reasoning as audio_pause(): the intent is the truth until the
+	// playback thread catches up with it.
+	if (playback_status == AUDIO_STATUS_PAUSED) {
+		playback_status = AUDIO_STATUS_PLAYING;
+	}
+	pthread_mutex_unlock(&audio_mutex);
+	playback_wake();
+}
+
+void audio_stop(void) {
+	printf("stopping\n");
+	pthread_mutex_lock(&audio_mutex);
+	resume_request_serial++;
+	restart_fresh_pending = false; // explicit stop/card removal cancels cold resume
+	audio_command = AUDIO_CMD_STOP;
+	playback_status = AUDIO_STATUS_STOPPED;
+	seek_request = false;
+	seek_target_secs = -1.0;
+	track_completed = false; // deliberate stop is not a natural completion
+	pthread_mutex_unlock(&audio_mutex);
+	playback_wake();
+}
+
+audio_status_t audio_get_status(void) {
+	pthread_mutex_lock(&audio_mutex);
+	audio_status_t status = playback_status;
+	pthread_mutex_unlock(&audio_mutex);
+	return status;
+}
+
+bool audio_take_completion(void) {
+	pthread_mutex_lock(&audio_mutex);
+	bool completed = track_completed;
+	track_completed = false;
+	pthread_mutex_unlock(&audio_mutex);
+	return completed;
+}
+
+void audio_get_current_file(char *out, size_t out_size) {
+	if (!out || out_size == 0)
+		return;
+	pthread_mutex_lock(&audio_mutex);
+	strncpy(out, current_filepath, out_size - 1);
+	out[out_size - 1] = '\0';
+	pthread_mutex_unlock(&audio_mutex);
+}
+
+void audio_get_progress(double *current_secs, double *total_secs) {
+	pthread_mutex_lock(&audio_mutex);
+	double current = progress_current_secs;
+	if (progress_floor_secs >= 0.0) {
+		if (current >= progress_floor_secs) {
+			progress_floor_secs = -1.0; // playback has caught up
+		} else {
+			current = progress_floor_secs;
+		}
+	}
+	if (current_secs)
+		*current_secs = current;
+	if (total_secs)
+		*total_secs = progress_total_secs;
+	pthread_mutex_unlock(&audio_mutex);
+}
+
+bool audio_get_listening_progress(double *current, double *total, unsigned *serial) {
+	pthread_mutex_lock(&audio_mutex);
+	if (current)
+		*current = progress_current_secs;
+	if (total)
+		*total = progress_total_secs;
+	if (serial)
+		*serial = progress_serial;
+	bool ready = !play_request && !seek_request && progress_reported_serial == progress_serial;
+	pthread_mutex_unlock(&audio_mutex);
+	return ready;
+}
+
+void audio_get_stream_info(int *sample_rate, int *channels) {
+	pthread_mutex_lock(&audio_mutex);
+	if (sample_rate)
+		*sample_rate = stream_sample_rate;
+	if (channels)
+		*channels = stream_channels;
+	pthread_mutex_unlock(&audio_mutex);
+}
+
+int audio_get_stream_bits(void) {
+	pthread_mutex_lock(&audio_mutex);
+	int bits = stream_bits;
+	pthread_mutex_unlock(&audio_mutex);
+	return bits;
+}
+
+int audio_get_device_rate(void) {
+	pthread_mutex_lock(&audio_mutex);
+	int rate = stream_device_rate;
+	pthread_mutex_unlock(&audio_mutex);
+	return rate;
+}
+
+int audio_get_stream_bitrate_kbps(void) {
+	pthread_mutex_lock(&audio_mutex);
+	int kbps = stream_bitrate_kbps;
+	pthread_mutex_unlock(&audio_mutex);
+	return kbps;
+}
+
+bool audio_stream_is_lossy(void) {
+	pthread_mutex_lock(&audio_mutex);
+	bool lossy = stream_lossy;
+	pthread_mutex_unlock(&audio_mutex);
+	return lossy;
+}
+
+void audio_get_stream_codec(char *out, size_t size) {
+	if (!out || size == 0) {
+		return;
+	}
+	pthread_mutex_lock(&audio_mutex);
+	snprintf(out, size, "%s", stream_codec);
+	pthread_mutex_unlock(&audio_mutex);
+}
+
+int audio_get_dsd_multiple(void) {
+	pthread_mutex_lock(&audio_mutex);
+	int m = stream_dsd_multiple;
+	pthread_mutex_unlock(&audio_mutex);
+	return m;
+}
+
+// Playback speed, for audiobooks. Applied on the next block, so it can be
+// changed while a book is playing without a gap.
+void audio_set_speed(double factor) {
+	pthread_mutex_lock(&audio_mutex);
+	playback_speed = factor;
+	pthread_mutex_unlock(&audio_mutex);
+}
+
+double audio_get_speed(void) {
+	pthread_mutex_lock(&audio_mutex);
+	double value = playback_speed;
+	pthread_mutex_unlock(&audio_mutex);
+	return value;
+}
+
+void audio_seek(double seconds) {
+	printf("seeking to %.2f seconds\n", seconds);
+
+	pthread_mutex_lock(&audio_mutex);
+	resume_request_serial++;
+	progress_serial++;
+	progress_current_secs = seconds; // the bar follows the finger, not the decoder
+	progress_floor_secs = -1.0;		// and a deliberate jump outranks the pause floor
+	if (restart_fresh_pending) {
+		// Suspend discarded the track context. Resume rebuilds it at this point.
+		restart_fresh_pos = seconds;
+	} else {
+		seek_target_secs = seconds;
+		seek_request = true;
+	}
+	pthread_mutex_unlock(&audio_mutex);
+	playback_wake();
+}
+
+// ---------------------------------------------------------------------------
+// where the sound goes
+// ---------------------------------------------------------------------------
+
+static bool output_device_set_if(const char *expected, const char *pcm) {
+	pthread_mutex_lock(&output_lock);
+	if (expected && strcmp(output_pcm, expected) != 0) {
+		pthread_mutex_unlock(&output_lock);
+		return false;
+	}
+	char before[sizeof(output_pcm)];
+	snprintf(before, sizeof(before), "%s", output_pcm);
+	if (pcm && pcm[0]) {
+		snprintf(output_pcm, sizeof(output_pcm), "%s", pcm);
+	} else {
+		snprintf(output_pcm, sizeof(output_pcm), "%s", AUDIO_DEFAULT_PCM);
+	}
+	// Only when it really moved, and on stderr. This line is how a log answers
+	// "did the sound stop going to the headphones, or did it stop coming out of
+	// them" -- so it must not be one of twenty identical lines, and it must not
+	// be sitting in a block buffer when the interesting moment passes.
+	char after[sizeof(output_pcm)];
+	snprintf(after, sizeof(after), "%s", output_pcm);
+	pthread_mutex_unlock(&output_lock);
+
+	if (strcmp(before, after) != 0) {
+		fprintf(stderr, "audio[%ld]: the output moves from '%s' to '%s'\n", log_ms(), before, after);
+		playback_wake();
+	}
+	return true;
+}
+
+void audio_set_output_device(const char *pcm) { (void)output_device_set_if(NULL, pcm); }
+
+void audio_get_output_device(char *out, size_t out_size) {
+	if (!out || out_size == 0) {
+		return;
+	}
+	pthread_mutex_lock(&output_lock);
+	snprintf(out, out_size, "%s", output_pcm);
+	pthread_mutex_unlock(&output_lock);
+}
+
+bool audio_get_output_format(audio_output_format_t *out) {
+	if (!out)
+		return false;
+	pthread_mutex_lock(&output_lock);
+	bool available = pcm_device_open && !strcmp(output_format_device, output_pcm) &&
+		output_format.rate > 0 && output_format.bits > 0 && output_format.channels > 0;
+	*out = available ? output_format : (audio_output_format_t){0};
+	pthread_mutex_unlock(&output_lock);
+	return available;
+}
+
+// ---------------------------------------------------------------------------
+// Somebody else's audio
+//
+// AirPlay is the case this exists for. shairport does not open a PCM -- it has
+// no ALSA backend at all, its `-o ot` backend is a unix-socket client -- so it
+// decodes ALAC and hands the player raw 44100/16/stereo frames to play. The
+// stock firmware does exactly the same thing, feeding them into the same output
+// chain local playback uses.
+//
+// This is deliberately NOT part of the playback thread: that thread's whole
+// shape is "open a file, decode it, write it", and there is no file here. It is
+// the device, opened by the same open_pcm_device() so the routing, the retries
+// and the fall back to the jack all behave identically, and written to by
+// whoever is holding the other end.
+//
+// The caller must stop local playback first. Two writers on one PCM is not a
+// thing ALSA does.
+// ---------------------------------------------------------------------------
+
+static int external_frame_bytes = 4;
+static pthread_mutex_t external_lock = PTHREAD_MUTEX_INITIALIZER;
+// End requests must be visible before waiting for the writer's lock. The
+// counter also prevents a new begin from overtaking any waiting teardown.
+static atomic_uint external_stopping;
+
+static bool external_write_cancelled(void) { return atomic_load_explicit(&external_stopping, memory_order_relaxed) != 0; }
+
+// What the open was made on, so a change can be noticed.
+//
+// Local playback reads alsa_output_key() every chunk and re-routes when it
+// moves. An external source has no decode loop to do that in, and the two
+// things the output depends on are only read when a PCM is opened:
+//
+//   the route ("Output Port Switch"), which is what sends the sound to the
+//   4.4 mm socket rather than the 3.5 mm one, and
+//
+//   the ALSA device name, which is what sends it to a USB-C DAC rather than
+//   to the internal one.
+//
+// Without watching both, plugging anything in while a Bluetooth receiver,
+// AirPlay or the emulator is running leaves the stream coming out of whatever
+// was in use when it started, and the socket the headphones are actually in
+// silent.
+static int external_rate;
+static int external_channels;
+static int external_bits;
+static int external_buffer_ms;
+static int external_route = -1;			// alsa_output_key() at the open
+static char external_device[160];		// the ALSA name at the open
+static long external_checked_ms;		// when the two above were last compared
+
+// Underruns since the open, and when the last one was reported. A receiver
+// that stutters says so in the log, and how often -- which is the difference
+// between a thread that is not scheduled in time and a sender that stalls now
+// and then over the air.
+static unsigned external_underruns;
+static long external_underrun_logged_ms;
+
+// The frames with the software volume applied, when it is in circuit.
+static unsigned char *external_scaled;
+static size_t external_scaled_size;
+
+// The conversion to the output's rate, when it runs at another one: the same
+// polyphase filters and doubling the file player uses (see bt_resample_t).
+// AirPlay, the game sounds and most radio are 44.1 kHz, and the headphones
+// are nearly always held at 48: without it every one of them went through
+// alsa's linear converter. What the device is opened at, with it.
+static bt_resample_t external_conv;
+static int external_dev_rate;
+static int external_dev_bits;
+
+// And the requantisation to 16 bits with dither, for an output that takes no
+// more (see dither_to_s16), on a copy of its own.
+static bool external_dither;
+static uint32_t external_dither_seed = 0x2545f491u;
+static int32_t *external_narrow;
+static size_t external_narrow_samples;
+
+// How often the check below is worth making. The jack is a sysfs read and the
+// device name a string compare under a mutex, so it is not expensive -- but at
+// 44.1 kHz a receiver hands over a chunk every eleven milliseconds, and doing
+// it ninety times a second on a single core buys nothing. A quarter of a
+// second is faster than a plug goes in.
+#define EXTERNAL_ROUTE_CHECK_MS 250
+
+// Under external_lock. Applies the route, opens, and records both.
+static bool external_open_locked(void) {
+	// The route first, as play_file() does it. Skipping it would inherit
+	// whatever route the last local track left behind -- or, on a player that
+	// has not played anything since boot, none at all.
+	auto_set_output();
+
+	// The output's rate, when the stream is converted to it here. Only the two
+	// widths the converter reads; the others are left to the plug, as before.
+	bt_resample_close(&external_conv);
+	external_dev_rate = external_rate;
+	external_dev_bits = external_bits;
+	int target = 0;
+	if (external_bits == 16 || external_bits == 32) {
+		target = bt_resample_target(external_rate, external_channels);
+		int halvings = 0;
+		if (!target) {
+			// No decimator on this path: only what the filters reach directly.
+			target = usb_rate_plan(external_rate, external_channels, &halvings);
+			if (halvings > 0 || !rate_convertible(external_rate, target)) {
+				target = 0;
+			}
+		}
+	}
+	if (target && bt_resample_open(&external_conv, external_rate, target, external_channels)) {
+		external_dev_rate = target;
+		external_dev_bits = 32;
+		fprintf(stderr, "audio: the external source's %d Hz is resampled to %d Hz here (%s), not by alsa's linear converter\n",
+				external_rate, target,
+				external_conv.poly ? (external_conv.twice ? "polyphase, half-band x2" : "polyphase") : "half-band x2");
+	} else {
+		bt_resample_close(&external_conv);
+	}
+	external_dither = external_dev_bits == 32 && !output_takes_wide();
+	if (external_dither) {
+		external_dev_bits = 16;
+		fprintf(stderr, "audio: the output takes 16 bits; the external source's 32-bit stream is dithered (TPDF) to 16 here\n");
+	}
+
+	pcm_forced_buffer_ms = external_buffer_ms;
+	snd_pcm_uframes_t period = 0;
+	pcm_open_error_t open_error = {0};
+	external_pcm = open_pcm_device(external_channels, external_dev_rate, external_dev_bits, &period, &open_error);
+	if (!external_pcm && external_conv.on && pcm_setup_fallback_allowed(&open_error)) {
+		// The output refused its own rate in S32: the stream goes as it did
+		// before, and the plug converts it.
+		fprintf(stderr, "audio: the resampled external stream would not open; alsa converts the %d Hz one instead\n",
+				external_rate);
+		bt_resample_close(&external_conv);
+		external_dither = false;
+		external_dev_rate = external_rate;
+		external_dev_bits = external_bits;
+		external_pcm = open_pcm_device(external_channels, external_dev_rate, external_dev_bits, &period, &open_error);
+	}
+	pcm_forced_buffer_ms = 0;
+
+	if (!external_pcm) {
+		return false;
+	}
+	pcm_device_open = true;
+	external_route = alsa_output_key();
+	audio_get_output_device(external_device, sizeof(external_device));
+	return true;
+}
+
+bool audio_external_begin(int sample_rate, int channels, int bits) {
+	return audio_external_begin_latency(sample_rate, channels, bits, 0);
+}
+
+// Under external_lock, which it lets go of while it waits. Gives the holder up
+// to `ms` to close the PCM after being asked, and says whether it did.
+static bool external_wait_closed(int ms) {
+	for (int waited = 0; external_pcm && waited < ms; waited += 10) {
+		pthread_mutex_unlock(&external_lock);
+		usleep(10 * 1000);
+		pthread_mutex_lock(&external_lock);
+	}
+	return !external_pcm;
+}
+
+// How long a holder that gives way is waited for: it notices between two
+// writes, a few tens of milliseconds.
+#define EXTERNAL_YIELD_WAIT_MS 1000
+
+bool audio_external_begin_latency(int sample_rate, int channels, int bits, int buffer_ms) {
+	if (external_write_cancelled())
+		return false;
+	// A PCM held by gapless occupies the DAC. Callers here want to open one of
+	// their own on the same device, and without this they find it busy right
+	// after a track has ended on its own.
+	gapless_release();
+
+	pthread_mutex_lock(&external_lock);
+	if (external_write_cancelled()) {
+		pthread_mutex_unlock(&external_lock);
+		return false;
+	}
+
+	// The metronome holds the output only until someone else wants it: asked,
+	// it closes, and this opens the PCM afresh on this source's own terms.
+	if (external_pcm && external_yielding) {
+		external_wanted = true;
+		external_wait_closed(EXTERNAL_YIELD_WAIT_MS);
+	}
+	// The wait released external_lock. A teardown may have arrived while the
+	// yielding owner handed it back; do not open ahead of that pending end.
+	if (external_write_cancelled()) {
+		pthread_mutex_unlock(&external_lock);
+		return false;
+	}
+
+	if (external_pcm) {
+		pthread_mutex_unlock(&external_lock);
+		return true; // already open, and on the same terms
+	}
+
+	// One frame is one sample per channel. 24-bit is the odd one out -- ALSA's
+	// S24_3LE packs it into three bytes, not four -- and this is what a partial
+	// write advances by, so getting it wrong would swap the channels for the
+	// rest of the stream rather than merely sounding wrong once.
+	external_frame_bytes = channels * (bits == 24 ? 3 : bits / 8);
+
+	// Remembered rather than merely used: a re-open after the headphones move
+	// has to ask for exactly the same stream. The buffer among them, because
+	// the emulator's short one is the whole of how it keeps time.
+	external_wanted = false;
+	external_rate = sample_rate;
+	external_channels = channels;
+	external_bits = bits;
+	external_buffer_ms = buffer_ms;
+	external_checked_ms = log_ms();
+	external_underruns = 0;
+	external_underrun_logged_ms = 0;
+
+	bool ok = external_open_locked();
+
+	printf("audio: external source %s (%d Hz, %d ch, %d bits)\n", ok ? "playing" : "COULD NOT OPEN", sample_rate,
+		   channels, bits);
+
+	pthread_mutex_unlock(&external_lock);
+	return ok;
+}
+
+bool audio_external_begin_yielding(int sample_rate, int channels, int bits, int buffer_ms) {
+	// Never shares: a PCM some other source holds is asked back first (the
+	// AirPlay receiver keeps one while it is merely switched on), and if it
+	// does not come back the answer is no.
+	//
+	// Asked without external_lock held, as local playback asks: the AirPlay
+	// side takes its own locks to hand the PCM back.
+	pthread_mutex_lock(&external_lock);
+	bool held = external_pcm != NULL;
+	pthread_mutex_unlock(&external_lock);
+	if (held) {
+		release_external_output();
+		pthread_mutex_lock(&external_lock);
+		bool closed = external_wait_closed(EXTERNAL_YIELD_WAIT_MS * 2);
+		pthread_mutex_unlock(&external_lock);
+		if (!closed) {
+			fprintf(stderr, "audio: the output is held by another source; not shared\n");
+			return false;
+		}
+	}
+
+	// A track paused a moment ago keeps the device for a few seconds more;
+	// paused, it is not playing, so it is asked to give it back now.
+	pthread_mutex_lock(&audio_mutex);
+	bool paused_holding = playback_status == AUDIO_STATUS_PAUSED && pcm_device_open;
+	pthread_mutex_unlock(&audio_mutex);
+	if (paused_holding) {
+		paused_release_wanted = true;
+		playback_wake();
+		for (int waited = 0; pcm_device_open && waited < EXTERNAL_YIELD_WAIT_MS; waited += 10) {
+			usleep(10 * 1000);
+		}
+		paused_release_wanted = false;
+	}
+
+	if (!audio_external_begin_latency(sample_rate, channels, bits, buffer_ms)) {
+		return false;
+	}
+	pthread_mutex_lock(&external_lock);
+	external_yielding = external_pcm != NULL;
+	pthread_mutex_unlock(&external_lock);
+	return true;
+}
+
+// Under external_lock. Re-opens when the headphones have moved, and says
+// whether there is still a PCM to write to.
+static bool external_follow_output(void) {
+	if (log_ms() - external_checked_ms < EXTERNAL_ROUTE_CHECK_MS) {
+		return true;
+	}
+	external_checked_ms = log_ms();
+
+	char device[sizeof(external_device)];
+	audio_get_output_device(device, sizeof(device));
+	int route = alsa_output_key();
+
+	if (route == external_route && strcmp(device, external_device) == 0) {
+		return true;
+	}
+
+	fprintf(stderr, "audio: the output moved under the external source (route %d -> %d, '%s' -> '%s'); re-opening\n",
+			external_route, route, external_device, device);
+
+	// Dropped rather than drained: what is still in the buffer belongs to the
+	// socket nobody is listening to any more, and draining it would play it
+	// there before the change took effect.
+	snd_pcm_drop(external_pcm);
+	snd_pcm_close(external_pcm);
+	external_pcm = NULL;
+	pcm_device_open = false;
+
+	if (!external_open_locked()) {
+		// The new device would not open. Saying so once is enough: the check
+		// runs again in a quarter of a second, and the next plug -- or the
+		// same one seated properly -- is another go at it.
+		fprintf(stderr, "audio: the new output would not open; the external source has nowhere to write\n");
+		return false;
+	}
+	return true;
+}
+
+// Recover only the handle, in the format of the current converted block.
+// external_open_locked() frees/replans the converter; calling it mid-block
+// would invalidate frames and possibly change their sample width/rate.
+static bool external_reopen_pcm_locked(void) {
+	snd_pcm_drop(external_pcm);
+	snd_pcm_close(external_pcm);
+	external_pcm = NULL;
+	pcm_device_open = false;
+	if (external_write_cancelled())
+		return false;
+	pcm_forced_buffer_ms = external_buffer_ms;
+	snd_pcm_uframes_t period = 0;
+	external_pcm = open_pcm_device(external_channels, external_dev_rate, external_dev_bits, &period, NULL);
+	pcm_forced_buffer_ms = 0;
+	pcm_device_open = external_pcm != NULL;
+	// Keep the old route identity. If opening changed it, the next input block
+	// will replan conversion safely, before obtaining any converted pointers.
+	external_checked_ms = 0;
+	return external_pcm != NULL;
+}
+
+// One bounded poll on every PCM. ALSA's snd_pcm_wait can internally repeat
+// spurious plugin readiness forever. A false-ready/error reply must also
+// yield the CPU; the next write supplies the actual recovery error.
+static void external_wait_room(void) {
+	if (pcm_wait_bluetooth(external_pcm, 50) != 0)
+		usleep(10 * 1000);
+}
+
+int audio_external_write(const void *frames, int count) {
+	pthread_mutex_lock(&external_lock);
+
+	if (!external_pcm || count <= 0 || external_write_cancelled()) {
+		pthread_mutex_unlock(&external_lock);
+		return 0;
+	}
+
+	// The headphones may have moved since the last chunk. This is the only
+	// place that runs often enough to notice: an external source has no decode
+	// loop of its own, and nothing else re-opens a PCM it did not open.
+	if (!external_follow_output()) {
+		pthread_mutex_unlock(&external_lock);
+		return 0;
+	}
+
+	// The software volume, as the decode loop applies it: the one way to set
+	// the level of a USB device with no volume control of its own. Without it
+	// the radio, AirPlay and the Bluetooth receiver played on such a device at
+	// full scale whatever the volume said. On a copy: the caller's frames are
+	// its own.
+	if (swvolume_active()) {
+		size_t bytes = (size_t)count * (size_t)external_frame_bytes;
+		if (bytes > external_scaled_size) {
+			unsigned char *grown = realloc(external_scaled, bytes);
+			if (!grown) {
+				pthread_mutex_unlock(&external_lock);
+				return 0;
+			}
+			external_scaled = grown;
+			external_scaled_size = bytes;
+		}
+		memcpy(external_scaled, frames, bytes);
+		int samples = count * external_channels;
+		if (external_bits == 8) {
+			swvolume_apply_u8(external_scaled, samples);
+		} else if (external_bits == 16) {
+			swvolume_apply_s16((short *)external_scaled, samples);
+		} else if (external_bits == 24) {
+			swvolume_apply_s24_3le(external_scaled, samples);
+		} else {
+			swvolume_apply_s32((int32_t *)external_scaled, samples);
+		}
+		frames = external_scaled;
+	}
+
+	// To the output's rate, last, as the file player does it.
+	int out_count = count;
+	int out_frame_bytes = external_frame_bytes;
+	if (external_conv.on) {
+		int made = 0;
+		const int32_t *converted =
+			bt_resample_block(&external_conv, frames, external_bits, count, external_channels, &made);
+		if (!converted) {
+			pthread_mutex_unlock(&external_lock);
+			return 0;
+		}
+		frames = converted;
+		out_count = made;
+		out_frame_bytes = external_channels * (int)sizeof(int32_t);
+		if (out_count == 0) {
+			// The filter holds it until the next chunk.
+			pthread_mutex_unlock(&external_lock);
+			return count;
+		}
+	}
+	if (external_dither) {
+		size_t samples = (size_t)out_count * (size_t)external_channels;
+		if (samples > external_narrow_samples) {
+			int32_t *grown = realloc(external_narrow, samples * sizeof(int32_t));
+			if (!grown) {
+				pthread_mutex_unlock(&external_lock);
+				return 0;
+			}
+			external_narrow = grown;
+			external_narrow_samples = samples;
+		}
+		memcpy(external_narrow, frames, samples * sizeof(int32_t));
+		dither_to_s16(&external_dither_seed, external_narrow, (int)samples);
+		frames = external_narrow;
+		out_frame_bytes = external_channels * (int)sizeof(int16_t);
+	}
+
+	int written = 0;
+	uint64_t last_progress_ms = paused_clock_ms();
+	unsigned recoveries = 0;
+	bool reopened = false;
+	while (written < out_count) {
+		if (external_write_cancelled())
+			break;
+		const void *chunk = (const char *)frames + (size_t)written * (size_t)out_frame_bytes;
+		if (pcm_takes_s24(external_pcm, external_dev_bits)) {
+			chunk = s24_from_s32(&external_s24, chunk, (size_t)(out_count - written) * (size_t)external_channels);
+		}
+		snd_pcm_sframes_t got =
+			chunk ? snd_pcm_writei(external_pcm, chunk, (snd_pcm_uframes_t)(out_count - written)) : -ENOMEM;
+		if (got > 0) {
+			written += (int)got;
+			last_progress_ms = paused_clock_ms();
+			recoveries = 0;
+			continue;
+		}
+		if (external_write_cancelled())
+			break;
+		if (got != 0 && got != -EAGAIN && got != -EPIPE && got != -ESTRPIPE) {
+			fprintf(stderr, "audio: external write failed: %s\n", snd_strerror((int)got));
+			break;
+		}
+		// All recovery paths share this no-progress window. A successful
+		// prepare/resume/open is not evidence that any frames were consumed.
+		uint64_t stalled = paused_clock_ms() - last_progress_ms;
+		if (stalled >= BT_WRITE_STALL_MS) {
+			if (!reopened) {
+				reopened = true;
+				fprintf(stderr, "audio: external PCM stalled; one same-format reopen\n");
+				if (external_reopen_pcm_locked())
+					continue; // one write probe; only positive frames reset the clock
+			}
+			fprintf(stderr, "audio: external PCM made no progress for %llu ms; returning partial block\n", (unsigned long long)stalled);
+			break;
+		}
+		if (got == 0 || got == -EAGAIN) {
+			// No room. A bluealsa PCM is opened non-blocking (open_pcm_device),
+			// so the wait that paces the source to real time happens here; the
+			// rest of the chunk is not dropped.
+			external_wait_room();
+			continue;
+		}
+		if (got == -EPIPE) {
+			// An underrun: the sender stalled, which over a wireless link is
+			// ordinary. Prepare and carry on rather than tearing the stream
+			// down over a gap. Reported at most every two seconds.
+			external_underruns++;
+			if (external_underrun_logged_ms == 0 || log_ms() - external_underrun_logged_ms >= 2000) {
+				external_underrun_logged_ms = log_ms();
+				fprintf(stderr, "audio: the external source ran dry (%u underruns since it opened)\n", external_underruns);
+			}
+			int error = snd_pcm_prepare(external_pcm);
+			if (error < 0) {
+				fprintf(stderr, "audio: external prepare failed: %s\n", snd_strerror(error));
+				break;
+			}
+			if (++recoveries > 1)
+				usleep(10 * 1000);
+			continue;
+		}
+		if (got == -ESTRPIPE) {
+			int error = -EAGAIN;
+			while (error == -EAGAIN && !external_write_cancelled() && paused_clock_ms() - last_progress_ms < BT_WRITE_STALL_MS) {
+				error = snd_pcm_resume(external_pcm);
+				if (error == -EAGAIN)
+					usleep(20 * 1000);
+			}
+			if (external_write_cancelled())
+				break;
+			if (error == -EAGAIN)
+				continue; // the shared deadline handles this failure too
+			if (error < 0 && (error = snd_pcm_prepare(external_pcm)) < 0) {
+				fprintf(stderr, "audio: external resume/prepare failed: %s\n", snd_strerror(error));
+				break;
+			}
+			if (++recoveries > 1)
+				usleep(10 * 1000);
+			continue;
+		}
+	}
+
+	pthread_mutex_unlock(&external_lock);
+	// In the caller's frames: what it handed over, scaled by how much of the
+	// converted block went out.
+	if (out_count != count) {
+		return written >= out_count ? count : (int)((long long)written * count / out_count);
+	}
+	return written;
+}
+
+void audio_external_end(void) {
+	atomic_fetch_add_explicit(&external_stopping, 1, memory_order_relaxed);
+	pthread_mutex_lock(&external_lock);
+
+	if (external_pcm) {
+		snd_pcm_drop(external_pcm);
+		snd_pcm_close(external_pcm);
+		external_pcm = NULL;
+		pcm_device_open = false;
+		external_yielding = false;
+		external_route = -1;
+		external_device[0] = '\0';
+		printf("audio: external source finished; device handed back (%u underruns)\n", external_underruns);
+	}
+	bt_resample_close(&external_conv);
+
+	pthread_mutex_unlock(&external_lock);
+	atomic_fetch_sub_explicit(&external_stopping, 1, memory_order_relaxed);
+}

@@ -1,0 +1,515 @@
+#include "music.h"
+
+#include "lvgl/lvgl.h"
+
+#include <stdio.h>
+#include <string.h>
+
+#include "src/gui/fonts/fonts.h"
+#include "src/gui/library/browser.h"
+#include "src/gui/library/libraryscan.h"
+#include "src/gui/library/medialist.h"
+#include "src/gui/library/playlistpage.h"
+#include "src/gui/library/search.h"
+#include "src/gui/library/shufflecard.h"
+#include "src/gui/nowplaying/coverflow.h"
+#include "src/gui/nowplaying/historypage.h"
+#include "src/gui/nowplaying/trackmenu.h"
+#include "src/gui/shell/gridpage.h"
+#include "src/gui/shell/gui.h"
+#include "src/gui/shell/icons.h"
+#include "src/gui/shell/settingsrow.h"
+#include "src/gui/shell/switcher.h"
+#include "src/gui/shell/sx_frame.h"
+#include "src/gui/shell/sx_sheet.h"
+#include "src/gui/shell/sx_tokens.h"
+#include "src/gui/shell/theme.h"
+#include "src/system/core/config.h"
+#include "src/system/core/lang.h"
+#include "src/system/library/library.h"
+
+lv_obj_t *music_screen;
+
+// The index tiles load their list from the database and then switch screen,
+// so each gets a tiny opener instead of a target screen pointer.
+static void open_all_tracks(void) { medialist_open(tr("music_all_tracks"), LIBRARY_LIST_TRACKS, LIBRARY_FILTER_NONE, NULL); }
+static void open_albums(void) { medialist_open(tr("albums"), LIBRARY_LIST_ALBUMS, LIBRARY_FILTER_NONE, NULL); }
+static void open_artists(void) { medialist_open(tr("artists"), LIBRARY_LIST_ARTISTS, LIBRARY_FILTER_NONE, NULL); }
+static void open_album_artists(void) { medialist_open(tr("music_album_artists"), LIBRARY_LIST_ALBUM_ARTISTS, LIBRARY_FILTER_NONE, NULL); }
+static void open_genres(void) { medialist_open(tr("music_genres"), LIBRARY_LIST_GENRES, LIBRARY_FILTER_NONE, NULL); }
+static void open_years(void) { medialist_open(tr("music_year"), LIBRARY_LIST_YEARS, LIBRARY_FILTER_NONE, NULL); }
+static void open_favourites(void) { medialist_open(tr("favourites"), LIBRARY_LIST_FAVOURITES, LIBRARY_FILTER_NONE, NULL); }
+static void open_most_played(void) { medialist_open(tr("music_most_played"), LIBRARY_LIST_MOST_PLAYED, LIBRARY_FILTER_NONE, NULL); }
+// The records that arrived last and the tracks heard last: short lists, the
+// newest on top, LIBRARY_RECENT_MAX of each. The count is the album list's
+// filter value, so the same handle code that narrows a list to one year
+// narrows this one to the newest records.
+static void open_recently_added(void) {
+	char limit[8];
+	snprintf(limit, sizeof(limit), "%d", LIBRARY_RECENT_MAX);
+	medialist_open(tr("music_recently_added"), LIBRARY_LIST_ALBUMS, LIBRARY_FILTER_RECENT, limit);
+}
+static void open_recently_played(void) { historypage_open(NULL); }
+static void open_browse(void) { switch_screen(browser_screen); }
+static void open_playlists(void) { playlistpage_open(); }
+
+static void playlists_description(char *text, size_t size) {
+	if (!gui_card_available() || !library_is_open())
+		return;
+	char **names = NULL;
+	int count = library_playlist_names(&names);
+	library_playlist_names_free(names, count);
+	snprintf(text, size, "%s: %d", tr("playlists"), count);
+}
+
+static lv_obj_t *tile_grid;
+static gui_config_t *grid_cfg;
+
+// ---------------------------------------------------------------------------
+// Which tiles, in which order
+//
+// Every tile is in use to begin with, in the order of TILES. The user can put
+// them in another order and leave some out (Music settings > Library >
+// Rearrange main page); at least one always stays. Both lists are
+// kept in the config by the tiles' names, so a tile added by a later build is
+// simply one the saved lists do not mention, and joins the end of the tiles in
+// use.
+// ---------------------------------------------------------------------------
+
+static const struct {
+	const char *id; // its name in the config, never translated
+	grid_entry_t entry;
+} TILES[MUSIC_TILE_COUNT] = {
+	[MUSIC_TILE_ALL] = {"all", {"music_all_tracks", &icon_menu_all, NULL, open_all_tracks, shufflecard_tracks_description}},
+	[MUSIC_TILE_ALBUMS] = {"albums", {"albums", &icon_menu_album, NULL, open_albums, shufflecard_albums_description}},
+	[MUSIC_TILE_ARTISTS] = {"artists", {"artists", &icon_menu_artist, NULL, open_artists}},
+	[MUSIC_TILE_ALBUM_ARTISTS] = {"album_artists", {"music_album_artists", &icon_menu_album_artist, NULL, open_album_artists}},
+	[MUSIC_TILE_GENRES] = {"genres", {"music_genres", &icon_menu_genre, NULL, open_genres}},
+	[MUSIC_TILE_YEARS] = {"years", {"music_year", &icon_menu_year, NULL, open_years}},
+	[MUSIC_TILE_FAVOURITES] = {"favourites", {"favourites", &icon_menu_favourites, NULL, open_favourites}},
+	[MUSIC_TILE_MOST_PLAYED] = {"most_played", {"music_most_played", &icon_menu_most_played, NULL, open_most_played}},
+	// Pictures borrowed from elsewhere rather than drawn for these two: the
+	// transfer arrows for what has just come onto the card, the resume glyph
+	// for what was being listened to.
+	[MUSIC_TILE_RECENTLY_ADDED] = {"recent_added", {"music_recently_added", &icon_menu_wifi_transfer, NULL, open_recently_added}},
+	[MUSIC_TILE_RECENTLY_PLAYED] = {"recent_played", {"queue_history", &icon_menu_audiobook_continue, NULL, open_recently_played}},
+	[MUSIC_TILE_PLAYLISTS] = {"playlists", {"playlists", &icon_menu_playlist, NULL, open_playlists, playlists_description}},
+	[MUSIC_TILE_BROWSE] = {"browse", {"music_browse", &icon_menu_explorer, NULL, open_browse}},
+};
+
+bool music_home_entry(music_tile_t tile, grid_entry_t *entry) {
+	if (tile < 0 || tile >= MUSIC_TILE_COUNT || !entry)
+		return false;
+	*entry = TILES[tile].entry;
+	return true;
+}
+
+static music_tile_t in_use[MUSIC_TILE_COUNT];
+static int in_use_n;
+static music_tile_t hidden[MUSIC_TILE_COUNT];
+static int hidden_n;
+static bool order_loaded;
+
+static int tile_by_id(const char *id, size_t len) {
+	for (int i = 0; i < MUSIC_TILE_COUNT; i++) {
+		if (strlen(TILES[i].id) == len && strncmp(TILES[i].id, id, len) == 0) {
+			return i;
+		}
+	}
+	return -1;
+}
+
+static bool listed(const music_tile_t *list, int n, music_tile_t tile) {
+	for (int i = 0; i < n; i++) {
+		if (list[i] == tile) {
+			return true;
+		}
+	}
+	return false;
+}
+
+// Reads one saved list ("albums,artists,...") into `list`, skipping names this
+// build does not know and any tile already placed in either list.
+static int parse_list(const char *text, music_tile_t *list) {
+	int n = 0;
+	const char *at = text ? text : "";
+	while (*at) {
+		const char *end = strchr(at, ',');
+		size_t len = end ? (size_t)(end - at) : strlen(at);
+		int tile = tile_by_id(at, len);
+		if (tile >= 0 && !listed(in_use, in_use_n, (music_tile_t)tile) && !listed(hidden, hidden_n, (music_tile_t)tile) && !listed(list, n, (music_tile_t)tile)) {
+			list[n++] = (music_tile_t)tile;
+		}
+		if (!end) {
+			break;
+		}
+		at = end + 1;
+	}
+	return n;
+}
+
+static void order_load(void) {
+	if (order_loaded) {
+		return;
+	}
+	order_loaded = true;
+	in_use_n = 0;
+	hidden_n = 0;
+	in_use_n = parse_list(config_get_copy("music", "tiles", "", (char[CONFIG_VALUE_SIZE]){0}, CONFIG_VALUE_SIZE), in_use);
+	hidden_n = parse_list(config_get_copy("music", "tiles_hidden", "", (char[CONFIG_VALUE_SIZE]){0}, CONFIG_VALUE_SIZE), hidden);
+	// Whatever neither list names is in use, at the end, in the usual order.
+	for (int i = 0; i < MUSIC_TILE_COUNT; i++) {
+		if (!listed(in_use, in_use_n, (music_tile_t)i) && !listed(hidden, hidden_n, (music_tile_t)i)) {
+			in_use[in_use_n++] = (music_tile_t)i;
+		}
+	}
+	if (in_use_n == 0 && hidden_n > 0) {
+		in_use[in_use_n++] = hidden[--hidden_n]; // never an empty page
+	}
+}
+
+static void save_list(const char *key, const music_tile_t *list, int n) {
+	char text[160] = "";
+	size_t used = 0;
+	for (int i = 0; i < n; i++) {
+		int wrote = snprintf(text + used, sizeof(text) - used, "%s%s", i ? "," : "", TILES[list[i]].id);
+		if (wrote < 0 || (size_t)wrote >= sizeof(text) - used) {
+			break;
+		}
+		used += (size_t)wrote;
+	}
+	config_set("music", key, text);
+}
+
+// The page's tiles, rebuilt from the lists, and the lists written down.
+static void order_changed(void) {
+	save_list("tiles", in_use, in_use_n);
+	save_list("tiles_hidden", hidden, hidden_n);
+	config_save();
+	music_rebuild_tiles();
+}
+
+static void list_remove(music_tile_t *list, int *n, music_tile_t tile) {
+	for (int i = 0; i < *n; i++) {
+		if (list[i] == tile) {
+			memmove(&list[i], &list[i + 1], (size_t)(*n - i - 1) * sizeof(*list));
+			(*n)--;
+			return;
+		}
+	}
+}
+
+static void list_insert(music_tile_t *list, int *n, music_tile_t tile, int position) {
+	if (position < 0) {
+		position = 0;
+	}
+	if (position > *n) {
+		position = *n;
+	}
+	memmove(&list[position + 1], &list[position], (size_t)(*n - position) * sizeof(*list));
+	list[position] = tile;
+	(*n)++;
+}
+
+int music_tiles_in_use_count(void) {
+	order_load();
+	return in_use_n;
+}
+
+music_tile_t music_tiles_in_use_at(int position) {
+	order_load();
+	return position >= 0 && position < in_use_n ? in_use[position] : MUSIC_TILE_ALL;
+}
+
+int music_tiles_hidden_count(void) {
+	order_load();
+	return hidden_n;
+}
+
+music_tile_t music_tiles_hidden_at(int position) {
+	order_load();
+	return position >= 0 && position < hidden_n ? hidden[position] : MUSIC_TILE_ALL;
+}
+
+void music_tiles_move_in_use(music_tile_t tile, int position) {
+	order_load();
+	if (tile < 0 || tile >= MUSIC_TILE_COUNT) {
+		return;
+	}
+	list_remove(in_use, &in_use_n, tile);
+	list_remove(hidden, &hidden_n, tile);
+	list_insert(in_use, &in_use_n, tile, position);
+	order_changed();
+}
+
+bool music_tiles_move_hidden(music_tile_t tile, int position) {
+	order_load();
+	if (tile < 0 || tile >= MUSIC_TILE_COUNT) {
+		return false;
+	}
+	// The last tile in use stays: a Music page with nothing on it has no way
+	// into the library at all.
+	if (listed(in_use, in_use_n, tile) && in_use_n <= 1) {
+		return false;
+	}
+	list_remove(in_use, &in_use_n, tile);
+	list_remove(hidden, &hidden_n, tile);
+	list_insert(hidden, &hidden_n, tile, position);
+	order_changed();
+	return true;
+}
+
+const char *music_tile_tag(music_tile_t tile) { return tile >= 0 && tile < MUSIC_TILE_COUNT ? TILES[tile].entry.label : ""; }
+
+const lv_image_dsc_t *music_tile_icon(music_tile_t tile) { return tile >= 0 && tile < MUSIC_TILE_COUNT ? TILES[tile].entry.icon : NULL; }
+
+void music_rebuild_tiles(void) {
+	if (!tile_grid || !grid_cfg) {
+		return;
+	}
+	order_load();
+	grid_entry_t entries[MUSIC_TILE_COUNT];
+	for (int i = 0; i < in_use_n; i++) {
+		entries[i] = TILES[in_use[i]].entry;
+	}
+	// Tiles at the size of the other sections' six: past the third row the
+	// page scrolls.
+	gridpage_set_entries(tile_grid, grid_cfg, entries, in_use_n, 2, 3, true);
+	lv_obj_scroll_to_y(tile_grid, 0, LV_ANIM_OFF);
+}
+
+static void search_cb(lv_event_t *e) {
+	(void)e;
+	search_open();
+}
+
+// With no tracks indexed the tiles would all open empty lists: the page says
+// a scan is needed instead, and the button asks which folders to scan.
+static lv_obj_t *empty_panel;
+
+static void scan_cb(lv_event_t *e) {
+	(void)e;
+	libraryscan_choose_folders();
+}
+
+// The tiles, or what stands in for them: a note that the card is missing --
+// the index lives on it -- or the scan panel while nothing is indexed.
+static void show_tiles_or_panel(void) {
+	if (!gui_card_available()) {
+		gridpage_show_no_card(tile_grid, empty_panel, show_tiles_or_panel);
+		return;
+	}
+	bool empty = !library_scan_running() && library_track_count() == 0;
+	gridpage_show_empty(tile_grid, empty_panel, empty);
+	// More tiles than the screen holds: the scrollbar shows for a moment.
+	if (!empty) {
+		gridpage_hint_scroll(tile_grid);
+	}
+}
+
+// ---------------------------------------------------------------------------
+// What a full rescan would add
+//
+// An index written before this firmware knew about track lengths or
+// compilations does without them until the card is scanned again
+// (library_index_missing()). Nothing rescans on its own -- that is minutes of
+// card reading, and the user's to start -- so the page says what a rescan
+// would bring, once: a card at the foot of the tiles, with the scan button and
+// "Not now". "Not now" is remembered for those features ([library]
+// index_notice_seen, a bit each), so the card comes back only for something
+// a later firmware adds. Built the first time it has something to say; on an
+// index that is up to date it costs one comparison per visit.
+//
+// The albums' colours and thumbnails (UI 2.0) are on the list too, but they
+// do not wait for the scan: the background job makes them on an index that
+// lacks them, and when it has been through every album the bit is written and
+// the card has nothing more to say about them. The scan is only the quicker
+// way, done while the card is being read anyway.
+// ---------------------------------------------------------------------------
+
+static lv_obj_t *upgrade_card;
+static lv_obj_t *upgrade_text;
+static lv_obj_t *upgrade_scan_pill;
+static lv_obj_t *upgrade_later_pill;
+
+static unsigned upgrade_pending(void) {
+	unsigned seen = (unsigned)config_get_int("library", "index_notice_seen", 0);
+	return library_index_missing() & ~seen;
+}
+
+static void upgrade_scan_cb(lv_event_t *e) {
+	(void)e;
+	// The scan row's own way in: which folders, then the scan page. The card
+	// goes when the scan has rewritten the index, not before -- the folder
+	// question can still be cancelled.
+	libraryscan_choose_folders();
+}
+
+static void upgrade_later_cb(lv_event_t *e) {
+	(void)e;
+	unsigned seen = (unsigned)config_get_int("library", "index_notice_seen", 0);
+	config_set_int("library", "index_notice_seen", (long)(seen | library_index_missing()));
+	config_save();
+	lv_obj_set_hidden(upgrade_card, true);
+}
+
+// The pills' colours are hand-set (settingsrow_pill_active), so a change of
+// theme paints them again.
+static void upgrade_repaint(void) {
+	settingsrow_pill_active(upgrade_scan_pill, true);
+	settingsrow_pill_active(upgrade_later_pill, false);
+}
+
+static void music_fit_slot(void) {
+	if (!grid_cfg)
+		return;
+	int reserve = sx_frame_idle() ? SX_MINI_SLOT_H : sx_frame_body_bottom();
+	if (tile_grid)
+		lv_obj_set_style_pad_bottom(tile_grid, grid_cfg->padding + reserve, 0);
+	if (upgrade_card)
+		lv_obj_align(upgrade_card, LV_ALIGN_BOTTOM_MID, 0, -grid_cfg->padding - reserve);
+}
+
+static void upgrade_build(void) {
+	upgrade_card = lv_obj_create(music_screen);
+	lv_obj_set_width(upgrade_card, grid_cfg->screen_width - 2 * grid_cfg->padding);
+	lv_obj_set_height(upgrade_card, LV_SIZE_CONTENT);
+	// Above the bottom slot, which on this page always holds something: the
+	// mini player, or the "Shuffle all music" card while nothing has played.
+	lv_obj_align(upgrade_card, LV_ALIGN_BOTTOM_MID, 0, -grid_cfg->padding - (sx_frame_idle() ? SX_MINI_SLOT_H : sx_frame_body_bottom()));
+	sx_frame_exempt(upgrade_card);
+	lv_obj_add_style(upgrade_card, &theme_style_card, 0);
+	lv_obj_set_style_radius(upgrade_card, 16, 0);
+	lv_obj_set_style_border_width(upgrade_card, 0, 0);
+	// Lifted off the tiles it lies over, so it reads as a notice and not as a
+	// seventh tile.
+	lv_obj_set_style_shadow_width(upgrade_card, 24, 0);
+	lv_obj_set_style_shadow_opa(upgrade_card, LV_OPA_40, 0);
+	lv_obj_set_style_shadow_color(upgrade_card, lv_color_black(), 0);
+	lv_obj_set_style_pad_all(upgrade_card, 20, 0);
+	lv_obj_set_style_pad_row(upgrade_card, 16, 0);
+	lv_obj_set_scrollable(upgrade_card, false);
+	lv_obj_set_flex_flow(upgrade_card, LV_FLEX_FLOW_COLUMN);
+
+	upgrade_text = lv_label_create(upgrade_card);
+	lv_label_set_long_mode(upgrade_text, LV_LABEL_LONG_WRAP);
+	lv_obj_set_width(upgrade_text, lv_pct(100));
+	lv_obj_add_style(upgrade_text, &theme_style_text, 0);
+	lv_obj_set_style_text_font(upgrade_text, &font_ui_22, 0);
+
+	lv_obj_t *pills = lv_obj_create(upgrade_card);
+	lv_obj_remove_style_all(pills);
+	lv_obj_set_size(pills, lv_pct(100), LV_SIZE_CONTENT);
+	lv_obj_set_style_pad_gap(pills, 12, 0);
+	lv_obj_set_scrollable(pills, false);
+	lv_obj_set_flex_flow(pills, LV_FLEX_FLOW_ROW_WRAP);
+	upgrade_scan_pill = settingsrow_pill(pills, "music_index_rescan", 0, upgrade_scan_cb);
+	upgrade_later_pill = settingsrow_pill(pills, "music_index_not_now", 0, upgrade_later_cb);
+	upgrade_repaint();
+	theme_register_refresh(upgrade_repaint);
+}
+
+// On the tiles only, never over the scan panel or the missing-card note, and
+// not while a scan is running: that scan is the answer already.
+static void upgrade_show(bool tiles_shown) {
+	unsigned pending = tiles_shown && !library_scan_running() ? upgrade_pending() : 0;
+	if (!pending) {
+		if (upgrade_card) {
+			lv_obj_set_hidden(upgrade_card, true);
+		}
+		return;
+	}
+	if (!upgrade_card) {
+		upgrade_build();
+	}
+	static const struct {
+		unsigned feature;
+		const char *tag;
+	} FEATURES[] = {
+		{LIBRARY_INDEX_DURATIONS, "music_index_durations"},
+		{LIBRARY_INDEX_COMPILATIONS, "music_index_compilations"},
+		{LIBRARY_INDEX_COVERS, "music_index_covers"},
+	};
+	char text[512];
+	int used = snprintf(text, sizeof(text), "%s", tr("music_index_notice"));
+	bool first = true;
+	for (size_t i = 0; i < sizeof(FEATURES) / sizeof(FEATURES[0]) && used < (int)sizeof(text); i++) {
+		if (pending & FEATURES[i].feature) {
+			used += snprintf(text + used, sizeof(text) - (size_t)used, "%s%s", first ? " " : ", ", tr(FEATURES[i].tag));
+			first = false;
+		}
+	}
+	lv_label_set_text(upgrade_text, text);
+	lv_obj_set_hidden(upgrade_card, false);
+	lv_obj_move_foreground(upgrade_card);
+}
+
+static void screen_loaded_cb(lv_event_t *e) {
+	(void)e;
+	show_tiles_or_panel();
+	upgrade_show(gui_card_available() && library_track_count() > 0);
+}
+
+// The header's one button: search. The music settings that sat beside it
+// are a row of the Settings page since 2.0 (principle 10: no button repeating
+// a tile or a row).
+static lv_obj_t *corner_button(gui_config_t *cfg, int slot, const lv_image_dsc_t *glyph) {
+	lv_obj_t *button = lv_btn_create(music_screen);
+	lv_obj_set_size(button, 56, 56);
+	lv_obj_set_style_bg_opa(button, LV_OPA_TRANSP, 0);
+	lv_obj_set_style_border_width(button, 0, 0);
+	lv_obj_set_style_shadow_width(button, 0, 0);
+	lv_obj_set_style_pad_all(button, 0, 0);
+	lv_obj_align(button, LV_ALIGN_TOP_RIGHT, -cfg->padding - slot * (56 + 6), cfg->padding + cfg->top_bar_height);
+
+	lv_obj_t *icon = lv_image_create(button);
+	lv_image_set_src(icon, glyph);
+	lv_obj_add_style(icon, &theme_style_icon, 0);
+	lv_obj_center(icon);
+
+	return button;
+}
+
+static void open_album_covers(void *unused) {
+	(void)unused;
+	coverflow_open();
+}
+
+static void music_more(lv_event_t *e) {
+	(void)e;
+	const sx_sheet_item_t item = {.label = tr("music_album_covers"), .icon = &icon_menu_album, .action = open_album_covers};
+	sx_sheet_menu(tr("music"), NULL, &item, 1);
+}
+
+void music_init(gui_config_t *cfg) {
+	switcher_browse_bind("music", music_screen, music_screen);
+	// Built empty and filled from the saved order. With more tiles than the
+	// three rows other sections have, the page scrolls to the rest.
+	grid_cfg = cfg;
+	lv_obj_t *grid = gridpage_build(music_screen, cfg, NULL, 0, 2, 3, true);
+	tile_grid = grid;
+	gridpage_set_scrolling(grid);
+	music_rebuild_tiles();
+
+	// Album covers have an explicit action; upward motion here only scrolls.
+
+	// The bottom slot always holds something on this page -- the mini player,
+	// or the "Shuffle all music" card while nothing has played -- so the last
+	// tiles can always be scrolled clear of it, whichever it is.
+	sx_frame_exempt(grid);
+	music_fit_slot();
+	sx_frame_on_body_change(music_fit_slot);
+
+	settingsrow_title_corner_slots(settingsrow_title(music_screen, cfg, "music"), cfg, 3);
+	trackmenu_queue_button(music_screen, cfg, 1);
+	lv_obj_t *more_btn = corner_button(cfg, 2, &icon_ellipsis_vertical);
+	lv_obj_add_event_cb(more_btn, music_more, LV_EVENT_CLICKED, NULL);
+
+	lv_obj_t *search_btn = corner_button(cfg, 0, &icon_search);
+	lv_obj_add_event_cb(search_btn, search_cb, LV_EVENT_CLICKED, NULL);
+
+	empty_panel = gridpage_empty_panel(music_screen, cfg, &icon_music_note, "music_no_database", scan_cb);
+	lv_obj_add_event_cb(music_screen, screen_loaded_cb, LV_EVENT_SCREEN_LOADED, NULL);
+
+	shufflecard_attach(music_screen, cfg);
+}

@@ -1,0 +1,836 @@
+name: Build Rage-os Release Firmware
+
+on:
+  push:
+    branches:
+      - main
+      - Rage-os
+
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: rage-os-release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # Latest HiBy R1 firmware Google Drive folder
+  HIBY_R1_LATEST_FOLDER: https://drive.google.com/drive/folders/1SbpnO8DanVWB54M4UeIM6XEzTCwzBbfB
+
+  # Rockbox/R1 build environment
+  RBDEV_HOST_PREFIX: ${{ github.workspace }}/sonix-player/rockbox-toolchain
+  RBDEV_DOWNLOAD: ${{ github.workspace }}/sonix-player/.cache/rbdev-dl
+  RBDEV_BUILD: ${{ github.workspace }}/sonix-player/.cache/rbdev-build
+  MAKEFLAGS: -j2
+
+  # Rolling Rage-os release
+  RAGE_OS_RELEASE_TAG: rage-os-release
+
+jobs:
+  build:
+    name: Build Rage-os Firmware
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+
+    steps:
+
+      # ============================================================
+      # CHECKOUT
+      # ============================================================
+      - name: Checkout Rage-os source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      # ============================================================
+      # VERIFY BRANCH
+      # ============================================================
+      - name: Verify Rage-os branch
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Current ref: ${GITHUB_REF}"
+          echo "Current branch: ${GITHUB_REF_NAME}"
+
+          if [ "${GITHUB_REF_NAME}" != "main" ] && [ "${GITHUB_REF_NAME}" != "Rage-os" ]; then
+            echo "ERROR: This workflow must run from main or Rage-os."
+            exit 1
+          fi
+
+      # ============================================================
+      # INSTALL BUILD DEPENDENCIES
+      # ============================================================
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          retry_apt() {
+            local attempt=1
+            local delay=15
+            local max_attempts=4
+
+            until sudo apt-get \
+              -o Acquire::Retries=5 \
+              -o Acquire::http::Timeout=30 \
+              -o Acquire::https::Timeout=30 \
+              "$@"; do
+              if [ "$attempt" -ge "$max_attempts" ]; then
+                echo "apt-get $1 failed after ${attempt} attempts."
+                return 1
+              fi
+
+              echo "apt-get $1 failed (attempt ${attempt}/${max_attempts}); retrying in ${delay}s."
+              sleep "$delay"
+              delay=$((delay * 2))
+              attempt=$((attempt + 1))
+            done
+          }
+
+          retry_apt update
+
+          retry_apt install -y --no-install-recommends \
+            autoconf \
+            automake \
+            autopoint \
+            bc \
+            bison \
+            build-essential \
+            bzip2 \
+            ca-certificates \
+            file \
+            flex \
+            genisoimage \
+            gettext \
+            gh \
+            git \
+            gzip \
+            gtk-doc-tools \
+            libgmp-dev \
+            libmpc-dev \
+            libmpfr-dev \
+            libtool \
+            libtool-bin \
+            make \
+            p7zip-full \
+            patch \
+            pkg-config \
+            python3 \
+            python3-venv \
+            rsync \
+            squashfs-tools \
+            tar \
+            texinfo \
+            unzip \
+            wget \
+            xz-utils
+
+          echo "Build dependencies installed."
+
+      # ============================================================
+      # VERIFY PROJECT STRUCTURE
+      # ============================================================
+      - name: Verify project structure
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -f sonix-player/Makefile
+          test -f sonix-player/rockboxdev/rockboxdev.sh
+          test -d sonix-player/rockboxdev/toolchain-patches
+
+          test -f sonix-packer/sonix_firmware_packer.sh
+          test -d sonix-packer/assets/R1
+
+          chmod +x sonix-player/rockboxdev/rockboxdev.sh
+          chmod +x sonix-packer/sonix_firmware_packer.sh
+
+          echo "Project structure verified."
+
+      # ============================================================
+      # RESTORE ROCKBOX TOOLCHAIN CACHE
+      # ============================================================
+      - name: Restore Rockbox toolchain cache
+        id: toolchain-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            sonix-player/rockbox-toolchain
+            sonix-player/.cache/rbdev-dl
+            sonix-player/.cache/rbdev-build
+          key: hiby-r1-toolchain-v1-${{ runner.os }}-${{ hashFiles('sonix-player/rockboxdev/rockboxdev.sh', 'sonix-player/rockboxdev/toolchain-patches/**') }}
+
+      # ============================================================
+      # RESTORE LIBRARY CACHE
+      # ============================================================
+      - name: Restore target library cache
+        id: libraries-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            sonix-player/freetype-target
+            sonix-player/audio-target
+            sonix-player/freetype-2.13.3.tar.xz
+            sonix-player/libogg-1.3.5.tar.gz
+            sonix-player/opus-1.4.tar.gz
+            sonix-player/opusfile-0.12.tar.gz
+            sonix-player/wavpack-5.6.0.tar.bz2
+          key: hiby-r1-libs-v1-${{ runner.os }}-${{ hashFiles('sonix-player/Makefile') }}
+
+      # ============================================================
+      # DOWNLOAD LATEST OFFICIAL HIBY R1 FIRMWARE
+      # ============================================================
+      - name: Download latest official HiBy R1 firmware
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "============================================"
+          echo "DOWNLOADING LATEST OFFICIAL HIBY R1 FIRMWARE"
+          echo "============================================"
+
+          rm -rf sonix-packer/hiby-latest-download
+          mkdir -p sonix-packer/hiby-latest-download
+
+          python3 -m venv "$RUNNER_TEMP/gdown-env"
+
+          "$RUNNER_TEMP/gdown-env/bin/python" \
+            -m pip install --upgrade pip
+
+          "$RUNNER_TEMP/gdown-env/bin/python" \
+            -m pip install "gdown==6.4.0"
+
+          echo "gdown version:"
+          "$RUNNER_TEMP/gdown-env/bin/gdown" --version
+
+          "$RUNNER_TEMP/gdown-env/bin/gdown" \
+            "$HIBY_R1_LATEST_FOLDER" \
+            --output sonix-packer/hiby-latest-download \
+            --folder
+
+          echo "Downloaded files:"
+
+          find sonix-packer/hiby-latest-download \
+            -type f \
+            -printf '%p\n' \
+            | sort
+
+      # ============================================================
+      # EXTRACT / FIND LATEST r1.upt
+      # ============================================================
+      - name: Prepare latest official R1 r1.upt
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          BASE_DIR="sonix-packer/hiby-latest-download"
+          OUTPUT="sonix-packer/r1_original.upt"
+
+          rm -f "$OUTPUT"
+
+          echo "============================================"
+          echo "LOCATING LATEST OFFICIAL R1 r1.upt"
+          echo "============================================"
+
+          DIRECT_UPT=$(find "$BASE_DIR" \
+            -type f \
+            \( -iname 'r1.upt' -o -iname 'R1.upt' \) \
+            -print \
+            -quit || true)
+
+          if [ -n "$DIRECT_UPT" ]; then
+            echo "Found direct r1.upt:"
+            echo "$DIRECT_UPT"
+
+            cp -f "$DIRECT_UPT" "$OUTPUT"
+
+          else
+            ZIP_FILE=$(find "$BASE_DIR" \
+              -type f \
+              \( -iname '*.zip' -o -iname '*.ZIP' \) \
+              -print \
+              -quit || true)
+
+            if [ -n "$ZIP_FILE" ]; then
+              echo "Found firmware ZIP:"
+              echo "$ZIP_FILE"
+
+              rm -rf "$RUNNER_TEMP/hiby-r1-v16-extracted"
+              mkdir -p "$RUNNER_TEMP/hiby-r1-v16-extracted"
+
+              unzip -o "$ZIP_FILE" \
+                -d "$RUNNER_TEMP/hiby-r1-v16-extracted"
+
+              EXTRACTED_UPT=$(find \
+                "$RUNNER_TEMP/hiby-r1-v16-extracted" \
+                -type f \
+                \( -iname 'r1.upt' -o -iname 'R1.upt' \) \
+                -print \
+                -quit || true)
+
+              if [ -n "$EXTRACTED_UPT" ]; then
+                echo "Found r1.upt inside ZIP:"
+                echo "$EXTRACTED_UPT"
+
+                cp -f "$EXTRACTED_UPT" "$OUTPUT"
+              fi
+            fi
+          fi
+
+          if [ ! -s "$OUTPUT" ]; then
+            TXT_UPT=$(find "$BASE_DIR" \
+              -type f \
+              \( -iname 'r1.upt.txt' -o -iname 'R1.upt.txt' \) \
+              -print \
+              -quit || true)
+
+            if [ -n "$TXT_UPT" ]; then
+              echo "Found r1.upt.txt:"
+              echo "$TXT_UPT"
+
+              cp -f "$TXT_UPT" "$OUTPUT"
+            fi
+          fi
+
+          if [ ! -s "$OUTPUT" ]; then
+            echo "ERROR: latest official HiBy R1 firmware r1.upt was not found."
+
+            find "$BASE_DIR" \
+              -type f \
+              -printf '%p\n' \
+              | sort
+
+            exit 1
+          fi
+
+          echo "============================================"
+          echo "LATEST OFFICIAL HIBY R1 FIRMWARE FOUND"
+          echo "============================================"
+
+          ls -lh "$OUTPUT"
+
+          echo "File type:"
+          file "$OUTPUT"
+
+          echo "SHA256:"
+          sha256sum "$OUTPUT"
+
+          echo "Size:"
+          stat -c '%s bytes' "$OUTPUT"
+
+          echo "UPT contents:"
+          7z l "$OUTPUT"
+
+          7z l "$OUTPUT" | grep -q 'ota_v0'
+
+          echo "Latest official HiBy R1 firmware is ready."
+
+      # ============================================================
+      # BUILD SONIX PLAYER
+      # ============================================================
+      - name: Build Sonix Player
+        working-directory: sonix-player
+        shell: bash
+        run: |
+          set -uo pipefail
+
+          echo "============================================"
+          echo "BUILDING SONIX PLAYER FOR HIBY R1"
+          echo "============================================"
+
+          make -j2 BOARD=r1 target
+          STATUS=$?
+
+          if [ "$STATUS" -ne 0 ]; then
+            echo "SONIX PLAYER BUILD FAILED"
+
+            find .cache/rbdev-build \
+              -type f \
+              -name '*.log' \
+              -print 2>/dev/null || true
+
+            for LOG in .cache/rbdev-build/build-*.log; do
+              [ -f "$LOG" ] || continue
+
+              echo "--------------------------------------------"
+              echo "$LOG"
+              echo "--------------------------------------------"
+
+              tail -n 250 "$LOG" || true
+            done
+
+            exit "$STATUS"
+          fi
+
+          test -x sonix_player
+          test -s sonix_player
+
+          ls -lh sonix_player
+          file sonix_player
+
+      # ============================================================
+      # SAVE TOOLCHAIN CACHE
+      # ============================================================
+      - name: Save Rockbox toolchain cache
+        if: success() && steps.toolchain-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            sonix-player/rockbox-toolchain
+            sonix-player/.cache/rbdev-dl
+            sonix-player/.cache/rbdev-build
+          key: ${{ steps.toolchain-cache.outputs.cache-primary-key }}
+
+      # ============================================================
+      # SAVE LIBRARY CACHE
+      # ============================================================
+      - name: Save target library cache
+        if: success() && steps.libraries-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            sonix-player/freetype-target
+            sonix-player/audio-target
+            sonix-player/freetype-2.13.3.tar.xz
+            sonix-player/libogg-1.3.5.tar.gz
+            sonix-player/opus-1.4.tar.gz
+            sonix-player/opusfile-0.12.tar.gz
+            sonix-player/wavpack-5.6.0.tar.bz2
+          key: ${{ steps.libraries-cache.outputs.cache-primary-key }}
+
+      # ============================================================
+      # COPY PLAYER TO PACKER
+      # ============================================================
+      - name: Prepare Sonix Player for packer
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cp -f \
+            sonix-player/sonix_player \
+            sonix-packer/sonix_player
+
+          chmod +x sonix-packer/sonix_player
+          chmod +x sonix-packer/sonix_firmware_packer.sh
+
+          test -s sonix-packer/sonix_player
+          test -s sonix-packer/r1_original.upt
+
+          echo "Official base:"
+          ls -lh sonix-packer/r1_original.upt
+
+          echo "Sonix Player:"
+          ls -lh sonix-packer/sonix_player
+
+          echo "SHA256:"
+
+          sha256sum \
+            sonix-packer/r1_original.upt \
+            sonix-packer/sonix_player
+
+      # ============================================================
+      # VERIFY PACKAGING TOOLS
+      # ============================================================
+      - name: Verify packaging tools
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          for TOOL in \
+            7z \
+            unsquashfs \
+            mksquashfs \
+            split \
+            tar \
+            md5sum \
+            sha256sum
+          do
+            command -v "$TOOL" >/dev/null || {
+              echo "Missing tool: $TOOL"
+              exit 1
+            }
+          done
+
+          ISO_TOOL=""
+
+          for TOOL in \
+            mkisofs \
+            genisoimage \
+            xorrisofs
+          do
+            if command -v "$TOOL" >/dev/null 2>&1; then
+              ISO_TOOL="$TOOL"
+              break
+            fi
+          done
+
+          test -n "$ISO_TOOL"
+
+          echo "Packaging tools verified."
+          echo "ISO writer: $ISO_TOOL"
+
+      # ============================================================
+      # BUILD CUSTOM R1.UPT
+      # ============================================================
+      - name: Build custom R1 firmware
+        working-directory: sonix-packer
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "============================================"
+          echo "PACKING SONIX PLAYER INTO HIBY R1 LATEST FIRMWARE"
+          echo "============================================"
+
+          ./sonix_firmware_packer.sh
+
+          test -s r1.upt
+
+          ls -lh r1.upt
+          file r1.upt
+          sha256sum r1.upt
+
+      # ============================================================
+      # VERIFY CUSTOM UPT
+      # ============================================================
+      - name: Verify custom R1 firmware
+        working-directory: sonix-packer
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "============================================"
+          echo "VERIFYING CUSTOM R1.UPT"
+          echo "============================================"
+
+          test -f r1.upt
+          test -s r1.upt
+
+          SIZE=$(stat -c '%s' r1.upt)
+
+          echo "Size: $SIZE bytes"
+
+          if [ "$SIZE" -lt 1048576 ]; then
+            echo "ERROR: r1.upt is unexpectedly small."
+            exit 1
+          fi
+
+          echo "UPT contents:"
+          7z l r1.upt
+
+          7z l r1.upt | grep -q 'ota_v0'
+
+          rm -rf "$RUNNER_TEMP/r1-verify"
+          mkdir -p "$RUNNER_TEMP/r1-verify"
+
+          7z x r1.upt \
+            -o"$RUNNER_TEMP/r1-verify" \
+            -y \
+            >/dev/null
+
+          OTA_DIR="$RUNNER_TEMP/r1-verify/ota_v0"
+
+          test -d "$OTA_DIR"
+          test -f "$OTA_DIR/ota_update.in"
+          test -f "$OTA_DIR/ota_compatibility.in"
+          grep -Fxq 'compatibility=hiby_r1_x1600_auto_rf_auto' \
+            "$OTA_DIR/ota_compatibility.in"
+          echo "R1 bootloader compatibility marker verified."
+
+          echo "============================================"
+          echo "ota_update.in"
+          echo "============================================"
+
+          cat "$OTA_DIR/ota_update.in"
+
+          ROOTFS_COUNT=$(
+            find "$OTA_DIR" \
+              -maxdepth 1 \
+              -type f \
+              -name 'rootfs.squashfs.*' \
+              | wc -l
+          )
+
+          echo "Rootfs chunks: $ROOTFS_COUNT"
+
+          if [ "$ROOTFS_COUNT" -lt 1 ]; then
+            echo "ERROR: No rootfs chunks found."
+            exit 1
+          fi
+
+          python3 - "$OTA_DIR" <<'PYOTA'
+          import hashlib
+          import re
+          import sys
+          from pathlib import Path
+
+          ota = Path(sys.argv[1])
+          update_text = (ota / "ota_update.in").read_text(encoding="ascii")
+          rootfs_block = next(
+              (block for block in re.split(r"\n\s*\n", update_text)
+               if re.search(r"(?m)^img_name=rootfs\.squashfs$", block)),
+              None,
+          )
+          if rootfs_block is None:
+              raise SystemExit("ERROR: rootfs entry is missing from ota_update.in.")
+
+          def field(name):
+              match = re.search(rf"(?m)^img_{name}=([0-9a-fA-F]+)$", rootfs_block)
+              if not match:
+                  raise SystemExit(f"ERROR: rootfs img_{name} is missing or malformed.")
+              return match.group(1)
+
+          expected_size = int(field("size"), 10)
+          overall_md5 = field("md5").lower()
+          if len(overall_md5) != 32:
+              raise SystemExit("ERROR: rootfs img_md5 is not a 32-character MD5.")
+
+          manifest = ota / f"ota_md5_rootfs.squashfs.{overall_md5}"
+          if not manifest.is_file():
+              raise SystemExit(f"ERROR: rootfs MD5 manifest is missing: {manifest.name}")
+          manifest_hashes = [line.strip().lower() for line in manifest.read_text(encoding="ascii").splitlines() if line.strip()]
+          chunks = sorted(ota.glob("rootfs.squashfs.*"))
+          if not chunks or len(chunks) != len(manifest_hashes):
+              raise SystemExit(
+                  f"ERROR: rootfs chunk/manifest count differs ({len(chunks)} chunks, "
+                  f"{len(manifest_hashes)} hashes)."
+              )
+
+          whole = hashlib.md5()
+          previous_md5 = overall_md5
+          total_size = 0
+          for index, chunk in enumerate(chunks):
+              match = re.fullmatch(r"rootfs\.squashfs\.(\d{4})\.([0-9a-fA-F]{32})", chunk.name)
+              if not match or int(match.group(1)) != index:
+                  raise SystemExit(f"ERROR: malformed or missing rootfs chunk sequence at {chunk.name}.")
+              if match.group(2).lower() != previous_md5:
+                  raise SystemExit(f"ERROR: MD5 chain filename is incorrect for {chunk.name}.")
+
+              chunk_md5 = hashlib.md5()
+              with chunk.open("rb") as source:
+                  while data := source.read(1024 * 1024):
+                      chunk_md5.update(data)
+                      whole.update(data)
+                      total_size += len(data)
+              actual_md5 = chunk_md5.hexdigest()
+              if actual_md5 != manifest_hashes[index]:
+                  raise SystemExit(f"ERROR: MD5 manifest entry does not match {chunk.name}.")
+              previous_md5 = actual_md5
+
+          if total_size != expected_size:
+              raise SystemExit(
+                  f"ERROR: rootfs chunks total {total_size} bytes; ota_update.in expects {expected_size}."
+              )
+          if whole.hexdigest() != overall_md5:
+              raise SystemExit("ERROR: reassembled rootfs MD5 does not match ota_update.in.")
+
+          print(f"Rootfs MD5 chain verified ({len(chunks)} chunks, {total_size} bytes).")
+          PYOTA
+
+          ROOTFS_IMAGE="$RUNNER_TEMP/r1-verify/rootfs.squashfs"
+
+          (
+            cd "$OTA_DIR"
+            cat rootfs.squashfs.*
+          ) > "$ROOTFS_IMAGE"
+
+          test -s "$ROOTFS_IMAGE"
+
+          echo "Rootfs image:"
+          ls -lh "$ROOTFS_IMAGE"
+
+          # ----------------------------------------------------------
+          # Verify the Sonix Player binary exists in the firmware.
+          # ----------------------------------------------------------
+          echo "Checking Sonix Player binary..."
+
+          unsquashfs -ll "$ROOTFS_IMAGE" \
+            | grep -q 'usr/bin/sonix_player' || {
+              echo "ERROR: usr/bin/sonix_player was not found."
+              exit 1
+            }
+
+          # ----------------------------------------------------------
+          # Verify firmware contains the expected main filesystem.
+          # ----------------------------------------------------------
+          echo "Checking root filesystem contents..."
+
+          unsquashfs -ll "$ROOTFS_IMAGE" \
+            | grep -q 'usr/resource/sonix' || {
+              echo "ERROR: Sonix resource directory was not found."
+              exit 1
+            }
+
+          echo "============================================"
+          echo "CUSTOM R1.UPT VERIFICATION PASSED"
+          echo "============================================"
+
+      # ============================================================
+      # CREATE BUILD INFORMATION
+      # ============================================================
+      - name: Create Rage-os build information
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          BUILD_TIME_IST=$(
+            TZ=Asia/Kolkata \
+            date '+%d-%m-%Y %I:%M:%S %p IST'
+          )
+
+          {
+            echo "Rage-os Release Firmware"
+            echo
+            echo "Branch: ${GITHUB_REF_NAME}"
+            echo "Commit: ${GITHUB_SHA}"
+            echo "Run number: ${GITHUB_RUN_NUMBER}"
+            echo "Build time: ${BUILD_TIME_IST}"
+            echo
+            echo "Base firmware: latest official HiBy R1 firmware"
+            echo
+            echo "This is a Rage-os build."
+          } > sonix-packer/rage-os-build-info.txt
+
+          cat sonix-packer/rage-os-build-info.txt
+
+      # ============================================================
+      # UPLOAD ARTIFACT
+      # ============================================================
+      - name: Upload Rage-os firmware artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rage-os-r1-${{ github.run_number }}
+          path: |
+            sonix-packer/r1.upt
+            sonix-packer/rage-os-build-info.txt
+          if-no-files-found: error
+          retention-days: 30
+
+      # ============================================================
+      # PREPARE RAGE-OS RELEASE
+      # ============================================================
+      - name: Prepare rolling Rage-os release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          TAG="${RAGE_OS_RELEASE_TAG}"
+          BUILD_TIME_IST=$(
+            TZ=Asia/Kolkata \
+            date '+%d-%m-%Y %I:%M:%S %p IST'
+          )
+
+          RELEASE_TITLE="Rage-os Release"
+
+          RELEASE_NOTES=$(
+            cat <<EOF
+          ## Rage-os Release
+
+          **Build time:** ${BUILD_TIME_IST}
+
+          **Commit:** ${GITHUB_SHA}
+
+          **Run:** #${GITHUB_RUN_NUMBER}
+
+          **Base firmware:** latest official HiBy R1 firmware
+
+          This Rage-os release is updated with each successful build from the Rage-os branch.
+          EOF
+          )
+
+          echo "Release tag: $TAG"
+          echo "Release title: $RELEASE_TITLE"
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Existing Rage-os release found."
+
+            gh release edit "$TAG" \
+              --title "$RELEASE_TITLE" \
+              --notes "$RELEASE_NOTES"
+
+          else
+            echo "Creating rolling Rage-os release."
+
+            gh release create "$TAG" \
+              --title "$RELEASE_TITLE" \
+              --notes "$RELEASE_NOTES" \
+              --target "$GITHUB_SHA"
+          fi
+
+      # ============================================================
+      # UPLOAD RAGE-OS FIRMWARE
+      # ============================================================
+      - name: Upload Rage-os release firmware
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          TAG="${RAGE_OS_RELEASE_TAG}"
+
+          test -s sonix-packer/r1.upt
+          test -s sonix-packer/rage-os-build-info.txt
+
+          gh release upload "$TAG" \
+            sonix-packer/r1.upt \
+            sonix-packer/rage-os-build-info.txt \
+            --clobber
+
+          echo "============================================"
+          echo "RAGE-OS RELEASE UPDATED"
+          echo "============================================"
+
+          gh release view "$TAG"
+
+      # ============================================================
+      # FINAL SUMMARY
+      # ============================================================
+      - name: Final build summary
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          BUILD_TIME_IST=$(
+            TZ=Asia/Kolkata \
+            date '+%d-%m-%Y %I:%M:%S %p IST'
+          )
+
+          {
+            echo "## Rage-os Release Firmware"
+            echo
+            echo "### Build successful"
+            echo
+            echo "- Branch: \`${GITHUB_REF_NAME}\`"
+            echo "- Commit: \`${GITHUB_SHA}\`"
+            echo "- Run: \`#${GITHUB_RUN_NUMBER}\`"
+            echo "- Build time: \`${BUILD_TIME_IST}\`"
+            echo "- Base firmware: latest official HiBy R1 firmware"
+            echo "- Release tag: \`${RAGE_OS_RELEASE_TAG}\`"
+            echo
+            echo "### Firmware"
+            echo
+            echo "\`sonix-packer/r1.upt\`"
+            echo
+            echo "### Verification"
+            echo
+            echo "- UPT archive valid"
+            echo "- ota_v0 present"
+            echo "- ota_update.in present"
+            echo "- R1 bootloader compatibility marker present"
+            echo "- Rootfs chunks present"
+            echo "- Sonix Player binary present"
+            echo
+            echo "### Result"
+            echo
+            echo "Rolling Rage-os release updated successfully."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "Build completed successfully."
