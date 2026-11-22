@@ -1,18 +1,60 @@
-﻿# Sonix Player
+<div align="center">
 
- (THIS IS THE SUCCESSOR TO M4ttia's SONIX REPO)
+<h1>Rage-os</h1>
 
-A replacement player for the **HiBy R3 Pro II** and the **HiBy R1**, written on
-LVGL.
+<p><strong>A community-inspired music player firmware for the HiBy R1.</strong></p>
 
-Everything it can do is in **[FEATURES.md](FEATURES.md)**.
+<p>Built on Sonix Player, with a refreshed interface, playful playback modes, and ListenBrainz scrobbling.</p>
+
+<p>
+  <a href="#screenshots">Screenshots</a> ·
+  <a href="#what-rage-os-adds-compared-with-sonix-os">Rage-os vs Sonix OS</a> ·
+  <a href="#install">Install</a> ·
+  <a href="#building-for-the-device">Build</a>
+</p>
+
+</div>
+
+> Rage-os is a community project based on Sonix Player. The current GitHub
+> Actions firmware package targets the HiBy R1.
+
+## Screenshots
+
+Add your captures under `screenshots/` and replace the placeholders below with
+image links when they are ready.
+
+| Home screen | Now Playing | Visualiser / iPod mode |
+|---|---|---|
+| *Add screenshot* | *Add screenshot* | *Add screenshot* |
+
+---
+
+## What Rage-os adds compared with Sonix OS
+
+These are the interface changes and features added on top of the Sonix Player
+base:
+
+| Area | Rage-os additions |
+|---|---|
+| **Interface** | Refreshed dark music-player UI, album-art accents, softened cards, and an animated mini-player that hides at the bottom of a page and in iPod mode. UI and interaction ideas are inspired by [sonix-player-rekkod-mod](https://github.com/Rekkod-Tree/sonix-player-rekkod-mod). |
+| **Touch gestures** | Swipe from the left edge to go back; swipe a track right to play it next or left to toggle favourites; tap or swipe up on the mini-player to open Now Playing; swipe it sideways to change tracks; drag it to preview-seek; pull down from the top bar for quick settings. |
+| **Now Playing** | Tap the artist name to open that artist’s album list. |
+| **Visualiser** | Classic iTunes-style visualiser, inspired by [sonix-visualiser](https://github.com/josephmalam/sonix-visualiser). |
+| **iPod mode** | An iPod-inspired playback mode accessible from the Now Playing menu. The mini-player is hidden while this mode is open. |
+| **Listening history** | Most Played rows show each track’s play count. |
+| **Audio** | Bit Perfect playback control is available in Music settings. |
+| **Scrobbling** | ListenBrainz support with a persistent offline queue that retries listens when the player reconnects. Add your own ListenBrainz token in the player settings. |
+| **Firmware builds** | GitHub Actions builds the R1 firmware and publishes it to the Rage-os release. |
+
+**Still in progress:** the requested two-column album artwork grid is not yet
+implemented in this branch.
 
 ## Install
 
-1. Download the firmware for your player from the
-   **[latest release](https://github.com/Jepl4r/sonix-player/releases/latest)**:
-   `r3proii.upt` for the R3 Pro II, `r1.upt` for the R1. **Never the other
-   one**: the update does not check which player it is given.
+1. Download **`r1.upt`** from the
+   **[latest Rage-os release](https://github.com/hkhrithik007/Rage-os/releases/latest)**.
+   Rage-os releases currently target the HiBy R1; do not flash this image on
+   another player.
 2. Charge the player **above 30%**.
 3. Copy the `.upt` file to the **root of the microSD card** and put the card
    in the player.
@@ -24,9 +66,8 @@ Everything it can do is in **[FEATURES.md](FEATURES.md)**.
 5. Let it flash: it says "Upgrading...", then "Succeeded", and reboots by
    itself.
 
-Once Sonix Player is installed, later versions can be installed straight from
-the player: Settings > System > Update firmware > Via internet downloads the
-right file from the latest release by itself.
+To install a later Rage-os version, download its `r1.upt` from the latest
+release and repeat the SD-card update steps above.
 
 > **Going back to the stock firmware:** flash the original firmware from
 > HiBy's website the same way.
@@ -35,7 +76,8 @@ right file from the latest release by itself.
 
 ## Supported players
 
-One binary runs on both. It reads which player it is on from
+The Sonix Player base supports both models. Rage-os GitHub Actions currently
+publishes firmware for the HiBy R1. The player reads its model from
 `system-info.json` at startup, and the firmware packer writes a different one
 into each image.
 
@@ -61,30 +103,6 @@ There are two builds from one tree:
 |---|---|---|
 | **host** | `sonix_player_host` | your PC, in an SDL window |
 | **target** | `sonix_player` | the device |
-
----
-
-## Rage OS interface
-
-The `Rage-os` branch uses a Spotify-inspired dark palette, green playback
-controls, a shortcut-based home screen, and a compact player with album art.
-The accent remains adjustable in Appearance settings. When cover accents are
-enabled, album art also tints a subtle home-screen gradient and the mini-player
-outline and progress bar. Cards use softer corners, and the mini-player fades
-and lifts into view when playback starts.
-
-| Gesture | Action |
-|---|---|
-| Swipe right from the left edge | Go back |
-| Swipe right on a track row | Add it to play next |
-| Swipe left on a track row | Add or remove it from favourites |
-| Tap the mini-player | Open Now Playing |
-| Swipe up on the mini-player | Open Now Playing |
-| Swipe left or right on the mini-player | Next or previous track |
-| Hold and drag horizontally on the mini-player | Preview and seek within the track |
-| Pull down from the top bar | Open quick settings |
-
-The other playback controls and existing queue reordering remain available.
 
 ---
 
@@ -234,7 +252,7 @@ Steps 1 to 3 happen once. Later builds go straight to step 4.
 
 ### Build with GitHub Actions
 
-Pushing to `Rage-os` or manually starting **Build Rage-os Release Firmware**
+Pushing to `main` or `Rage-os`, or manually starting **Build Rage-os Release Firmware**
 from the Actions tab builds and packages the R1 firmware. Each successful run
 updates the **Rage-os Release** GitHub release and uploads a run artifact named
 `rage-os-r1-<run number>` containing `r1.upt` and build information.
