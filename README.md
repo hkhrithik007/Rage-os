@@ -30,8 +30,8 @@
     <td align="center"><strong>Visualiser</strong><br><img src="https://github.com/user-attachments/assets/a618eb7b-5283-4ac1-a51b-63a468cdde3f" alt="Rage-os visualiser" width="220"></td>
   </tr>
   <tr>
-    <td align="center"><strong>iPod mode</strong><br><img src="https://github.com/user-attachments/assets/8c4d5dae-e219-4a68-bc29-d802796da142" alt="Rage-os iPod mode" width="220"></td>
-    <td align="center"><strong>iPod mode</strong><br><img src="https://github.com/user-attachments/assets/dfa8ae34-be31-436b-af8a-3e65fe562779" alt="Rage-os iPod mode alternate view" width="220"></td>
+    <td align="center"><strong>Listenbrainz</strong><br><img src="https://github.com/user-attachments/assets/8c4d5dae-e219-4a68-bc29-d802796da142" alt="Rage-os iPod mode" width="220"></td>
+    <td align="center"><strong>Album layout</strong><br><img src="https://github.com/user-attachments/assets/dfa8ae34-be31-436b-af8a-3e65fe562779" alt="Rage-os iPod mode alternate view" width="220"></td>
   </tr>
 </table>
 
