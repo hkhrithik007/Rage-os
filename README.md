@@ -19,12 +19,21 @@
 > Actions firmware package targets the HiBy R1.
 
 ## Screenshots
-<img width="480" height="800" alt="screenshot-20261122-215856" src="https://github.com/user-attachments/assets/ba7cb512-4588-4717-887f-ab0879b26e3f" >
-| Home screen <img width="480" height="800" alt="screenshot-20261122-215954" src="https://github.com/user-attachments/assets/1e890a8c-d9ab-4dbc-9448-26c957415416" > | Now Playing <img width="480" height="800" alt="screenshot-20261122-220008" src="https://github.com/user-attachments/assets/65606725-b21c-4450-b084-dd2bd830d5ef" > | Visualiser <img width="480" height="800" alt="screenshot-20261122-215958" src="https://github.com/user-attachments/assets/a618eb7b-5283-4ac1-a51b-63a468cdde3f" >
-| iPod mode 
 
-<img width="480" height="800" alt="screenshot-20261122-215940" src="https://github.com/user-attachments/assets/8c4d5dae-e219-4a68-bc29-d802796da142" >
-<img width="480" height="800" alt="screenshot-20261122-215912" src="https://github.com/user-attachments/assets/dfa8ae34-be31-436b-af8a-3e65fe562779" >
+<table align="center">
+  <tr>
+    <td align="center"><strong>Rage-os</strong><br><img src="https://github.com/user-attachments/assets/ba7cb512-4588-4717-887f-ab0879b26e3f" alt="Rage-os screen" width="220"></td>
+    <td align="center"><strong>Home screen</strong><br><img src="https://github.com/user-attachments/assets/1e890a8c-d9ab-4dbc-9448-26c957415416" alt="Rage-os home screen" width="220"></td>
+  </tr>
+  <tr>
+    <td align="center"><strong>Now Playing</strong><br><img src="https://github.com/user-attachments/assets/65606725-b21c-4450-b084-dd2bd830d5ef" alt="Rage-os Now Playing screen" width="220"></td>
+    <td align="center"><strong>Visualiser</strong><br><img src="https://github.com/user-attachments/assets/a618eb7b-5283-4ac1-a51b-63a468cdde3f" alt="Rage-os visualiser" width="220"></td>
+  </tr>
+  <tr>
+    <td align="center"><strong>iPod mode</strong><br><img src="https://github.com/user-attachments/assets/8c4d5dae-e219-4a68-bc29-d802796da142" alt="Rage-os iPod mode" width="220"></td>
+    <td align="center"><strong>iPod mode</strong><br><img src="https://github.com/user-attachments/assets/dfa8ae34-be31-436b-af8a-3e65fe562779" alt="Rage-os iPod mode alternate view" width="220"></td>
+  </tr>
+</table>
 
 ---
 
